@@ -2,3 +2,5 @@ xgboost==1.7.6
 flask
 joblib
 scikit-learn
+pandas
+python-dotenv

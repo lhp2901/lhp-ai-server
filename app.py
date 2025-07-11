@@ -1,19 +1,27 @@
 from flask import Flask, request, jsonify
+import subprocess
 import joblib
+import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
+# ───────────────────────────────
 app = Flask(__name__)
 
-# Load model dùng joblib
+# Load model
+model_path = os.getenv("MODEL_PATH", "model/model.pkl")
 try:
-    model = joblib.load("model.pkl")
+    model = joblib.load(model_path)
 except Exception as e:
-    print("❌ Lỗi khi load model:", str(e))
+    print(f"❌ Lỗi khi load model từ {model_path}:", str(e))
     model = None
 
+# ──────────────── PREDICT ────────────────
 @app.route("/predict", methods=["POST"])
 def predict():
     if model is None:
-        return jsonify({ "error": "Model chưa load được!" }), 500
+        return jsonify({"error": "Model chưa load được!"}), 500
 
     try:
         data = request.get_json()
@@ -38,8 +46,48 @@ def predict():
         })
 
     except Exception as e:
-        return jsonify({ "error": f"Lỗi xử lý: {str(e)}" }), 500
+        return jsonify({"error": f"Lỗi xử lý dữ liệu: {str(e)}"}), 500
 
-# ⚠️ Lưu ý: Render yêu cầu host 0.0.0.0 + port 10000
+# ──────────────── TRAIN ────────────────
+@app.route("/train", methods=["POST"])
+def train_model():
+    try:
+        result = subprocess.run(
+            ["python", "scripts/train_ai_model.py"],
+            capture_output=True,
+            text=True
+        )
+        return jsonify({"message": result.stdout or result.stderr})
+    except Exception as e:
+        return jsonify({"error": f"Lỗi train model: {str(e)}"}), 500
+
+# ──────────────── OPTIMIZE ────────────────
+@app.route("/optimize", methods=["POST"])
+def optimize():
+    try:
+        result = subprocess.run(
+            ["python", "scripts/portfolio_optimizer.py"],
+            capture_output=True,
+            text=True
+        )
+        return jsonify({"message": result.stdout or result.stderr})
+    except Exception as e:
+        return jsonify({"error": f"Lỗi optimize: {str(e)}"}), 500
+
+# ──────────────── PREDICT ALL ────────────────
+@app.route("/predict_all", methods=["POST"])
+def predict_all():
+    try:
+        result = subprocess.run(
+            ["python", "scripts/predict_all.py"],
+            capture_output=True,
+            text=True
+        )
+        return jsonify({"message": result.stdout or result.stderr})
+    except Exception as e:
+        return jsonify({"error": f"Lỗi predict_all: {str(e)}"}), 500
+
+# ──────────────── CHẠY SERVER ────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
