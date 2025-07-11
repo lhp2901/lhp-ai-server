@@ -87,6 +87,11 @@ def predict_all():
     except Exception as e:
         return jsonify({"error": f"Lỗi predict_all: {str(e)}"}), 500
 
+# ⚠️ Cấu hình cho Render
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ LHP-AI-SERVER đang hoạt động!"        
+
 # ──────────────── CHẠY SERVER ────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
