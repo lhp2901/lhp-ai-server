@@ -94,5 +94,8 @@ def home():
 
 # ──────────────── CHẠY SERVER ────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Render sẽ tự set biến PORT
+    import os
+    port = int(os.environ.get("PORT", 10000))  # Mặc định local chạy port 10000
     app.run(host="0.0.0.0", port=port)
+
+    
