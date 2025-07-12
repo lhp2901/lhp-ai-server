@@ -13,10 +13,10 @@ env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # ❗ Quan trọng: phải dùng key ghi được
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong .env", file=sys.stderr)
+    print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY", file=sys.stderr)
     sys.exit(1)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -28,7 +28,7 @@ REQUIRED_COLUMNS = [
 ]
 
 def fetch_ai_input_data() -> pd.DataFrame:
-    print("📡 Đang lấy dữ liệu cần dự đoán từ Supabase...", file=sys.stderr)
+    print("📡 Lấy dữ liệu chưa dự đoán từ bảng ai_signals...", file=sys.stderr)
     try:
         res = supabase.table("ai_signals") \
             .select("*") \
@@ -41,13 +41,21 @@ def fetch_ai_input_data() -> pd.DataFrame:
     print(f"📊 Tổng dòng cần dự đoán: {len(df)}", file=sys.stderr)
     return df
 
+def classify_recommendation(p: float) -> str:
+    if p >= 0.75:
+        return "BUY"
+    elif p <= 0.4:
+        return "SELL"
+    else:
+        return "WATCH"
+
 def predict(df: pd.DataFrame) -> pd.DataFrame:
     if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"❌ Không tìm thấy model tại: {MODEL_PATH}")
+        raise FileNotFoundError(f"❌ Không tìm thấy mô hình tại: {MODEL_PATH}")
 
     model = joblib.load(MODEL_PATH)
 
-    # 🔍 Bổ sung cột thiếu nếu cần
+    # Bổ sung các cột thiếu
     for col in REQUIRED_COLUMNS:
         if col not in df.columns:
             print(f"⚠️ Thiếu cột {col} → tạo với giá trị 0", file=sys.stderr)
@@ -57,27 +65,22 @@ def predict(df: pd.DataFrame) -> pd.DataFrame:
     probs = model.predict_proba(X)
 
     df["ai_predicted_probability"] = probs[:, 1]
-    df["ai_recommendation"] = df["ai_predicted_probability"].apply(
-        lambda p: "BUY" if p > 0.6 else "SELL"
-    )
-
+    df["ai_recommendation"] = df["ai_predicted_probability"].apply(classify_recommendation)
     return df
 
 def save_results(df: pd.DataFrame):
-    print(f"💾 Đang ghi {len(df)} dòng kết quả lên Supabase...", file=sys.stderr)
+    print(f"💾 Ghi {len(df)} dòng kết quả lên Supabase...", file=sys.stderr)
 
-    # 🧼 Lọc chỉ các cột cần upsert
-    df = df[["symbol", "date", "ai_predicted_probability", "ai_recommendation"]].copy()
-
-    df = df.where(pd.notnull(df), None)  # Replace NaN với None để phù hợp Supabase
-    payload = df.to_dict(orient="records")
+    cols = ["user_id", "symbol", "date", "ai_predicted_probability", "ai_recommendation"]
+    df = df[cols].copy()
+    df = df.where(pd.notnull(df), None)
 
     try:
         supabase.table("ai_signals") \
-            .upsert(payload, on_conflict="symbol,date") \
+            .upsert(df.to_dict(orient="records"), on_conflict="user_id,symbol,date") \
             .execute()
     except Exception as e:
-        raise RuntimeError(f"❌ Lỗi khi ghi kết quả về Supabase: {e}")
+        raise RuntimeError(f"❌ Lỗi ghi kết quả về Supabase: {e}")
 
 def main():
     try:
