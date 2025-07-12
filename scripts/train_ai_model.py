@@ -6,7 +6,7 @@ import joblib
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-# ✅ Fix Unicode cho Windows
+# ✅ Unicode cho Windows terminal
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ✅ Load biến môi trường
@@ -14,7 +14,7 @@ load_dotenv()
 
 # 🔐 Kiểm tra biến môi trường
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # Dùng key này mới đủ quyền
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY")
@@ -27,7 +27,10 @@ def fetch_data():
     print("📥 Đang tải dữ liệu từ Supabase...")
     try:
         res = supabase.table("ai_signals").select("*").execute()
-        df = pd.DataFrame(res.data or [])
+        if not res.data:
+            print("⚠️ Không có dữ liệu trả về.")
+            return pd.DataFrame()
+        df = pd.DataFrame(res.data)
         print(f"📊 Tổng số dòng tải về: {len(df)}")
         return df
     except Exception as e:
@@ -45,15 +48,16 @@ def preprocess(df):
             print(f"⚠️ Thiếu cột {col} → tạo với giá trị 0")
             df[col] = 0
 
-    df = df[expected]
-    
-    # Chuyển đổi về số
+    # ✨ Ép tạo bản sao an toàn để tránh SettingWithCopyWarning
+    df = df[expected].copy()
+
+    # 🎯 Ép kiểu số cho toàn bộ cột
     for col in expected:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    
+
     df = df.dropna()
 
-    # Bỏ nếu không đủ đa dạng nhãn
+    # 🚫 Không đủ nhãn phân loại
     label_counts = df["label_win"].value_counts()
     if len(label_counts) < 2:
         print("❌ label_win không đủ đa dạng (chỉ có 1 loại nhãn).")

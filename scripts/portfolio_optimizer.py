@@ -16,7 +16,7 @@ def read_input():
         sys.exit(1)
 
 def validate_data(df: pd.DataFrame):
-    required_cols = {'symbol', 'ai_predicted_probability', 'ai_recommendation'}
+    required_cols = {'symbol', 'date', 'ai_predicted_probability', 'ai_recommendation'}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Thiếu các cột: {', '.join(missing)}")
@@ -24,18 +24,28 @@ def validate_data(df: pd.DataFrame):
     df = df[df['ai_predicted_probability'].notnull()].copy()
     df['ai_predicted_probability'] = pd.to_numeric(df['ai_predicted_probability'], errors='coerce')
     df['ai_recommendation'] = df['ai_recommendation'].astype(str)
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
-    df = df[df['ai_predicted_probability'].notnull()]
+    # Loại bỏ dòng thiếu ngày hoặc xác suất không hợp lệ
+    df = df[df['ai_predicted_probability'].notnull() & df['date'].notnull()]
+
+    return df
+
+def drop_duplicates_keep_latest(df: pd.DataFrame):
+    df = df.sort_values(by="date", ascending=False)
+    df = df.drop_duplicates(subset="symbol", keep="first")
     return df
 
 def select_portfolio(df: pd.DataFrame):
     df = df.sort_values(by='ai_predicted_probability', ascending=False)
-
     buy_df = df[df['ai_recommendation'].str.upper() == 'BUY'].copy()
 
     if not buy_df.empty:
         total_prob = buy_df['ai_predicted_probability'].sum()
-        buy_df['allocation'] = buy_df['ai_predicted_probability'] / total_prob
+        if total_prob == 0:
+            buy_df['allocation'] = 1.0 / len(buy_df)
+        else:
+            buy_df['allocation'] = buy_df['ai_predicted_probability'] / total_prob
         buy_df['recommendation'] = 'BUY'
         print("✅ Có mã BUY → Phân bổ theo xác suất", file=sys.stderr)
 
@@ -43,9 +53,11 @@ def select_portfolio(df: pd.DataFrame):
             .rename(columns={'ai_predicted_probability': 'probability'}) \
             .to_dict(orient='records')
 
+    # Fallback nếu không có mã BUY
     fallback = df.head(3).copy()
     fallback['recommendation'] = 'WATCH'
-    fallback['allocation'] = 1.0 / len(fallback) if len(fallback) > 0 else 0
+    n = len(fallback)
+    fallback['allocation'] = 1.0 / n if n > 0 else 0
     print("🟡 Không có mã BUY → fallback sang WATCH", file=sys.stderr)
 
     return fallback[['symbol', 'ai_predicted_probability', 'recommendation', 'allocation']] \
@@ -58,6 +70,8 @@ def main():
         df = pd.DataFrame(raw_data)
 
         df = validate_data(df)
+        df = drop_duplicates_keep_latest(df)
+
         if df.empty:
             print(json.dumps({"message": "⚠️ Không có dữ liệu hợp lệ để tối ưu"}))
             return

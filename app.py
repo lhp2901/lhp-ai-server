@@ -2,53 +2,68 @@ from flask import Flask, request, jsonify
 import subprocess
 import joblib
 import os
-
+import numpy as np
+import json
 from dotenv import load_dotenv
+
+# ─────────── Load biến môi trường ───────────
 load_dotenv()
 
-# ───────────────────────────────
+# ─────────── Khởi tạo Flask ───────────
 app = Flask(__name__)
 
-# Load model
-model_path = os.getenv("MODEL_PATH", "model/model.pkl")
-try:
-    model = joblib.load(model_path)
-except Exception as e:
-    print(f"❌ Lỗi khi load model từ {model_path}:", str(e))
-    model = None
+# ─────────── Load mô hình AI ───────────
+MODEL_PATH = os.getenv("MODEL_PATH", "model/model.pkl")
+model = None
 
-# ──────────────── PREDICT ────────────────
+try:
+    model = joblib.load(MODEL_PATH)
+    print(f"✅ Loaded model từ {MODEL_PATH}")
+except Exception as e:
+    print(f"❌ Lỗi khi load model từ {MODEL_PATH}: {str(e)}")
+
+# ─────────── Predict cho 1 mã ───────────
 @app.route("/predict", methods=["POST"])
 def predict():
     if model is None:
-        return jsonify({"error": "Model chưa load được!"}), 500
+        return jsonify({"error": "❌ Model chưa được load"}), 500
 
     try:
         data = request.get_json()
 
-        features = [
-            data["close"],
-            data["volume"],
-            data["ma20"],
-            data["rsi"],
-            data["bb_upper"],
-            data["bb_lower"],
-            data["foreign_buy_value"],
-            data["foreign_sell_value"],
+        expected_fields = [
+            'close', 'volume', 'ma20', 'rsi',
+            'bb_upper', 'bb_lower', 'foreign_buy_value', 'foreign_sell_value'
         ]
 
-        proba = model.predict_proba([features])[0][1]
-        recommendation = "MUA" if proba > 0.7 else "KHÔNG"
+        features = []
+        for field in expected_fields:
+            if field not in data:
+                return jsonify({"error": f"❌ Thiếu trường bắt buộc: {field}"}), 400
+            try:
+                features.append(float(data[field]))
+            except Exception:
+                features.append(0)
+
+        X = np.array([features])
+        prob = model.predict_proba(X)[0][1]
+
+        recommendation = (
+            "MUA" if prob > 0.7 else
+            "BÁN" if prob < 0.3 else
+            "GIỮ"
+        )
 
         return jsonify({
-            "probability": round(proba, 4),
+            "probability": round(float(prob), 4),
             "recommendation": recommendation
         })
 
     except Exception as e:
-        return jsonify({"error": f"Lỗi xử lý dữ liệu: {str(e)}"}), 500
+        print("🔥 Predict error:", str(e))
+        return jsonify({"error": f"❌ Lỗi xử lý dữ liệu: {str(e)}"}), 500
 
-# ──────────────── TRAIN ────────────────
+# ─────────── Train mô hình ───────────
 @app.route("/train", methods=["POST"])
 def train_model():
     try:
@@ -57,11 +72,11 @@ def train_model():
             capture_output=True,
             text=True
         )
-        return jsonify({"message": result.stdout or result.stderr})
+        return jsonify({ "message": result.stdout or result.stderr })
     except Exception as e:
-        return jsonify({"error": f"Lỗi train model: {str(e)}"}), 500
+        return jsonify({ "error": f"Lỗi train model: {str(e)}" }), 500
 
-# ──────────────── OPTIMIZE ────────────────
+# ─────────── Tối ưu danh mục ───────────
 @app.route("/optimize", methods=["POST"])
 def optimize():
     try:
@@ -70,11 +85,11 @@ def optimize():
             capture_output=True,
             text=True
         )
-        return jsonify({"message": result.stdout or result.stderr})
+        return jsonify({ "message": result.stdout or result.stderr })
     except Exception as e:
-        return jsonify({"error": f"Lỗi optimize: {str(e)}"}), 500
+        return jsonify({ "error": f"Lỗi optimize: {str(e)}" }), 500
 
-# ──────────────── PREDICT ALL ────────────────
+# ─────────── Dự đoán toàn bộ ───────────
 @app.route("/predict_all", methods=["POST"])
 def predict_all():
     try:
@@ -83,19 +98,72 @@ def predict_all():
             capture_output=True,
             text=True
         )
-        return jsonify({"message": result.stdout or result.stderr})
+        return jsonify({ "message": result.stdout or result.stderr })
     except Exception as e:
-        return jsonify({"error": f"Lỗi predict_all: {str(e)}"}), 500
+        return jsonify({ "error": f"Lỗi predict_all: {str(e)}" }), 500
 
-# ⚠️ Cấu hình cho Render
+@app.route("/portfolio", methods=["POST"])
+def portfolio():
+    try:
+        raw_data = request.get_json()
+
+        if not raw_data or "userId" not in raw_data:
+            return jsonify({"error": "Thiếu userId!"}), 400
+
+        # 👉 Lấy dữ liệu từ Supabase (hoặc từ file / DB nếu bạn đã lưu sẵn)
+        import supabase
+        from supabase import create_client
+        import os
+
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # dùng SERVICE ROLE mới được quyền đọc toàn bộ
+
+        sb = create_client(supabase_url, supabase_key)
+
+        resp = sb.table("ai_signals").select("*")\
+            .eq("user_id", raw_data["userId"])\
+            .order("date", desc=True)\
+            .execute()
+
+        records = resp.data or []
+
+        # Gọi portfolio_optimizer.py bằng subprocess
+        import subprocess
+        import json
+
+        p = subprocess.Popen(
+            ["python", "scripts/portfolio_optimizer.py"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        stdout, stderr = p.communicate(json.dumps(records))
+
+        if p.returncode != 0:
+            return jsonify({ "error": "Lỗi khi chạy portfolio_optimizer", "stderr": stderr }), 500
+
+        try:
+            portfolio = json.loads(stdout)
+        except:
+            return jsonify({ "error": "Lỗi parse kết quả JSON từ optimizer", "raw": stdout }), 500
+
+        return jsonify({
+            "date": records[0]["date"] if records else None,
+            "portfolio": portfolio
+        })
+
+    except Exception as e:
+        return jsonify({ "error": f"Lỗi xử lý portfolio: {str(e)}" }), 500
+     
+
+# ─────────── Endpoint kiểm tra ───────────
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ LHP-AI-SERVER đang hoạt động!"        
+    return "✅ LHP-AI-SERVER đang hoạt động!"
 
-# ──────────────── CHẠY SERVER ────────────────
+# ─────────── Chạy server ───────────
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 10000))  # Mặc định local chạy port 10000
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
-    

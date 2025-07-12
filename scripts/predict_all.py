@@ -13,15 +13,15 @@ env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # ❗ Quan trọng: phải dùng key ghi được
 
-if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_ANON_KEY trong .env", file=sys.stderr)
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong .env", file=sys.stderr)
     sys.exit(1)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-MODEL_PATH = Path("scripts") / "model.pkl"
+MODEL_PATH = Path("model") / "model.pkl"
 REQUIRED_COLUMNS = [
     "close", "volume", "ma20", "rsi",
     "bb_upper", "bb_lower", "foreign_buy_value", "foreign_sell_value"
@@ -47,9 +47,11 @@ def predict(df: pd.DataFrame) -> pd.DataFrame:
 
     model = joblib.load(MODEL_PATH)
 
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing:
-        raise ValueError(f"❌ Thiếu cột cần thiết: {missing}")
+    # 🔍 Bổ sung cột thiếu nếu cần
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            print(f"⚠️ Thiếu cột {col} → tạo với giá trị 0", file=sys.stderr)
+            df[col] = 0
 
     X = df[REQUIRED_COLUMNS].fillna(0)
     probs = model.predict_proba(X)
@@ -59,11 +61,15 @@ def predict(df: pd.DataFrame) -> pd.DataFrame:
         lambda p: "BUY" if p > 0.6 else "SELL"
     )
 
-    return df[["symbol", "date", "ai_predicted_probability", "ai_recommendation"]]
+    return df
 
 def save_results(df: pd.DataFrame):
     print(f"💾 Đang ghi {len(df)} dòng kết quả lên Supabase...", file=sys.stderr)
-    df = df.where(pd.notnull(df), None)
+
+    # 🧼 Lọc chỉ các cột cần upsert
+    df = df[["symbol", "date", "ai_predicted_probability", "ai_recommendation"]].copy()
+
+    df = df.where(pd.notnull(df), None)  # Replace NaN với None để phù hợp Supabase
     payload = df.to_dict(orient="records")
 
     try:
@@ -71,7 +77,7 @@ def save_results(df: pd.DataFrame):
             .upsert(payload, on_conflict="symbol,date") \
             .execute()
     except Exception as e:
-        raise RuntimeError(f"❌ Lỗi khi ghi kết quả: {e}")
+        raise RuntimeError(f"❌ Lỗi khi ghi kết quả về Supabase: {e}")
 
 def main():
     try:
