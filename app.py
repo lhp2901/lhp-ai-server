@@ -106,19 +106,17 @@ def predict_all():
 def portfolio():
     try:
         raw_data = request.get_json()
-        print("📩 Nhận dữ liệu:", raw_data)
 
         if not raw_data or "userId" not in raw_data:
             return jsonify({"error": "Thiếu userId!"}), 400
 
-        import os
+        # 👉 Lấy dữ liệu từ Supabase (hoặc từ file / DB nếu bạn đã lưu sẵn)
+        import supabase
         from supabase import create_client
+        import os
 
         supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-        if not supabase_url or not supabase_key:
-            return jsonify({"error": "Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY"}), 500
+        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # dùng SERVICE ROLE mới được quyền đọc toàn bộ
 
         sb = create_client(supabase_url, supabase_key)
 
@@ -128,8 +126,8 @@ def portfolio():
             .execute()
 
         records = resp.data or []
-        print("📦 Lấy được", len(records), "dòng dữ liệu")
 
+        # Gọi portfolio_optimizer.py bằng subprocess
         import subprocess
         import json
 
@@ -142,16 +140,14 @@ def portfolio():
         )
 
         stdout, stderr = p.communicate(json.dumps(records))
-        print("📤 Optimizer stdout:", stdout)
-        print("⚠️ stderr:", stderr)
 
         if p.returncode != 0:
             return jsonify({ "error": "Lỗi khi chạy portfolio_optimizer", "stderr": stderr }), 500
 
         try:
             portfolio = json.loads(stdout)
-        except Exception as e:
-            return jsonify({ "error": "Lỗi parse kết quả JSON từ optimizer", "raw": stdout, "err": str(e) }), 500
+        except:
+            return jsonify({ "error": "Lỗi parse kết quả JSON từ optimizer", "raw": stdout }), 500
 
         return jsonify({
             "date": records[0]["date"] if records else None,
@@ -159,8 +155,6 @@ def portfolio():
         })
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return jsonify({ "error": f"Lỗi xử lý portfolio: {str(e)}" }), 500
      
 
