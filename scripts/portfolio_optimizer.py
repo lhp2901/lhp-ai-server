@@ -2,8 +2,6 @@ import sys
 import json
 import pandas as pd
 import traceback
-from supabase import create_client, Client
-from dotenv import load_dotenv
 
 REQUIRED_COLS = {"symbol", "date", "ai_predicted_probability", "ai_recommendation"}
 
@@ -25,7 +23,7 @@ def validate_and_prepare(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df["ai_predicted_probability"] = pd.to_numeric(df["ai_predicted_probability"], errors="coerce")
-    df["ai_recommendation"] = df["ai_recommendation"].astype(str).str.upper()
+    df["ai_recommendation"] = df["ai_recommendation"].fillna("").astype(str).str.upper()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
     # Loại bỏ dòng thiếu giá trị cốt lõi
@@ -54,8 +52,8 @@ def allocate_portfolio(df: pd.DataFrame) -> list:
             .rename(columns={"ai_predicted_probability": "probability"}) \
             .to_dict(orient="records")
 
-    # fallback → WATCH 3 mã top xác suất
-    fallback = df.head(3).copy()
+    # fallback → WATCH 3 mã top xác suất (loại trùng symbol)
+    fallback = df.drop_duplicates(subset="symbol").head(3).copy()
     fallback["recommendation"] = "WATCH"
     fallback["allocation"] = 1.0 / len(fallback) if len(fallback) > 0 else 0
     print("🟡 Không có mã BUY → fallback sang WATCH", file=sys.stderr)
