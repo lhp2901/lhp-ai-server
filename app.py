@@ -110,39 +110,39 @@ def predict_all():
 @app.route("/portfolio", methods=["POST"])
 def portfolio():
     try:
-        # 📥 Nhận dữ liệu đầu vào từ client
+        # Check bắt đầu
+        print("✅ Đã vào route /portfolio")
+
         raw_data = request.get_json()
         if not raw_data or "userId" not in raw_data:
             return jsonify({"error": "❌ Thiếu userId trong request!"}), 400
 
         user_id = raw_data["userId"]
+        print("📥 userId:", user_id)
 
-        # 🌐 Lấy biến môi trường
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-        if not supabase_url or not supabase_key:
-            return jsonify({"error": "❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY"}), 500
+        print("🔑 Supabase URL:", supabase_url)
+        print("🔑 Supabase Key:", "Có" if supabase_key else "Không có")
 
-        # 🔌 Tạo client Supabase
-        if not create_client:
-            return jsonify({ "error": "⚠️ create_client chưa được import — kiểm tra gói supabase" }), 500
-
+        from supabase import create_client  # ❗ THÊM NGAY TRONG HÀM ĐỂ DEBUG CHẮC ĂN
         sb = create_client(supabase_url, supabase_key)
-        print(f"✅ Supabase client created for user {user_id}")
 
-        # 📊 Lấy dữ liệu từ bảng ai_signals
+        print("✅ Supabase client created")
+
+        # Truy vấn
         resp = sb.table("ai_signals").select("*") \
             .eq("user_id", user_id) \
             .order("date", desc=True) \
             .execute()
 
         records = resp.data or []
+        print("📊 Số bản ghi:", len(records))
 
         if not records:
             return jsonify({"error": "❌ Không có dữ liệu AI signals cho user này"}), 404
 
-        # ⚙️ Gọi script portfolio_optimizer.py
         input_json = json.dumps(records)
         p = subprocess.Popen(
             ["python", "scripts/portfolio_optimizer.py"],
@@ -153,6 +153,9 @@ def portfolio():
         )
 
         stdout, stderr = p.communicate(input=input_json)
+
+        print("📤 STDOUT:", stdout)
+        print("📛 STDERR:", stderr)
 
         if p.returncode != 0:
             return jsonify({
@@ -174,12 +177,13 @@ def portfolio():
         })
 
     except Exception as e:
+        import traceback
         traceback_str = traceback.format_exc()
+        print("🔥 FLASK CRASH TOÀN BỘ:\n", traceback_str)
         return jsonify({
             "error": f"🔥 Lỗi xử lý portfolio: {str(e)}",
             "trace": traceback_str
-        }), 500
-     
+        }), 500     
 
 # ─────────── Endpoint kiểm tra ───────────
 @app.route("/", methods=["GET"])
