@@ -105,32 +105,36 @@ def predict_all():
 @app.route("/portfolio", methods=["POST"])
 def portfolio():
     try:
-        # 🧾 Nhận dữ liệu đầu vào
+        print("📥 Step 1: Đọc dữ liệu từ client")
         raw_data = request.get_json()
         if not raw_data or "userId" not in raw_data:
             return jsonify({"error": "Thiếu userId!"}), 400
 
         user_id = raw_data["userId"]
+        print(f"🆔 user_id: {user_id}")
 
-        # 🔐 Load biến môi trường
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        print(f"🔐 ENV loaded: {bool(supabase_url)} - {bool(supabase_key)}")
 
         if not supabase_url or not supabase_key:
             return jsonify({"error": "Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong .env"}), 500
 
-        # 🧠 Kết nối Supabase
         sb = create_client(supabase_url, supabase_key)
+        print("🌐 Supabase client created")
+
         resp = sb.table("ai_signals").select("*")\
             .eq("user_id", user_id)\
             .order("date", desc=True)\
             .execute()
-
+        
         records = resp.data or []
+        print(f"📊 Số lượng bản ghi lấy được: {len(records)}")
+
         if not records:
             return jsonify({"error": "Không tìm thấy dữ liệu AI signals cho user này"}), 404
 
-        # ⚙️ Gọi subprocess để chạy optimizer
+        print("⚙️ Gọi optimizer subprocess")
         p = subprocess.Popen(
             ["python", "scripts/portfolio_optimizer.py"],
             stdin=subprocess.PIPE,
@@ -141,6 +145,9 @@ def portfolio():
 
         input_data = json.dumps(records)
         stdout, stderr = p.communicate(input=input_data)
+
+        print("📤 Optimizer stdout:", stdout)
+        print("📛 Optimizer stderr:", stderr)
 
         if p.returncode != 0:
             return jsonify({
@@ -162,7 +169,10 @@ def portfolio():
         })
 
     except Exception as e:
+        import traceback
+        print("❌ Exception:", traceback.format_exc())
         return jsonify({ "error": f"Lỗi xử lý portfolio: {str(e)}" }), 500
+
 
 # ─────────── Endpoint kiểm tra ───────────
 @app.route("/", methods=["GET"])
