@@ -2,6 +2,8 @@ import sys
 import json
 import pandas as pd
 import traceback
+from supabase import create_client, Client
+from dotenv import load_dotenv
 
 REQUIRED_COLS = {"symbol", "date", "ai_predicted_probability", "ai_recommendation"}
 
