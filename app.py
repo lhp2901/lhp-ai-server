@@ -5,9 +5,12 @@ import os
 import numpy as np
 import json
 from dotenv import load_dotenv
-from supabase import create_client
 
-
+try:
+    from supabase import create_client
+    print("✅ Đã import được create_client từ supabase")
+except Exception as e:
+    print("❌ Không import được create_client:", str(e))
 # ─────────── Load biến môi trường ───────────
 load_dotenv()
 
