@@ -107,32 +107,37 @@ def predict_all():
 @app.route("/portfolio", methods=["POST"])
 def portfolio():
     try:
-        # 📥 Nhận dữ liệu từ client
+        # 📥 Nhận dữ liệu đầu vào từ client
         raw_data = request.get_json()
         if not raw_data or "userId" not in raw_data:
-            return jsonify({"error": "Thiếu userId!"}), 400
+            return jsonify({"error": "❌ Thiếu userId trong request!"}), 400
 
         user_id = raw_data["userId"]
 
-        # 🔐 Lấy biến môi trường
+        # 🌐 Lấy biến môi trường
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
         if not supabase_url or not supabase_key:
-            return jsonify({"error": "Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong .env"}), 500
+            return jsonify({"error": "❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY"}), 500
 
-        # 🔗 Kết nối Supabase
+        # 🔌 Tạo client Supabase
         sb = create_client(supabase_url, supabase_key)
+        print(f"✅ Supabase client created for user {user_id}")
 
-        resp = sb.table("ai_signals").select("*")\
-            .eq("user_id", user_id)\
-            .order("date", desc=True)\
+        # 📊 Lấy dữ liệu từ bảng ai_signals
+        resp = sb.table("ai_signals").select("*") \
+            .eq("user_id", user_id) \
+            .order("date", desc=True) \
             .execute()
 
         records = resp.data or []
+
         if not records:
-            return jsonify({"error": "Không tìm thấy dữ liệu AI signals cho user này"}), 404
+            return jsonify({"error": "❌ Không có dữ liệu AI signals cho user này"}), 404
 
         # ⚙️ Gọi script portfolio_optimizer.py
+        input_json = json.dumps(records)
         p = subprocess.Popen(
             ["python", "scripts/portfolio_optimizer.py"],
             stdin=subprocess.PIPE,
@@ -141,12 +146,11 @@ def portfolio():
             text=True
         )
 
-        input_json = json.dumps(records)
         stdout, stderr = p.communicate(input=input_json)
 
         if p.returncode != 0:
             return jsonify({
-                "error": "Lỗi khi chạy portfolio_optimizer",
+                "error": "❌ portfolio_optimizer.py trả lỗi",
                 "stderr": stderr.strip()
             }), 500
 
@@ -154,7 +158,7 @@ def portfolio():
             portfolio = json.loads(stdout)
         except json.JSONDecodeError:
             return jsonify({
-                "error": "Không parse được kết quả từ optimizer",
+                "error": "❌ Không parse được kết quả JSON từ optimizer",
                 "raw_output": stdout
             }), 500
 
@@ -164,10 +168,9 @@ def portfolio():
         })
 
     except Exception as e:
-        import traceback
         traceback_str = traceback.format_exc()
         return jsonify({
-            "error": f"Lỗi xử lý portfolio: {str(e)}",
+            "error": f"🔥 Lỗi xử lý portfolio: {str(e)}",
             "trace": traceback_str
         }), 500
      
