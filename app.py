@@ -6,9 +6,8 @@ import numpy as np
 import json
 from dotenv import load_dotenv
 from supabase import create_client
-import supabase      
+import supabase     
     
-
 # ─────────── Load biến môi trường ───────────
 load_dotenv()
 

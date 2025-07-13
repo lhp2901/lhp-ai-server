@@ -38,7 +38,8 @@ def get_latest_signals(df: pd.DataFrame) -> pd.DataFrame:
     return df_latest
 
 def allocate_portfolio(df: pd.DataFrame) -> list:
-    buy_df = df[df["ai_recommendation"] == "BUY"].copy()
+    # 🔁 Chọn các mã có xác suất dự đoán thắng cao
+    buy_df = df[df["ai_predicted_probability"] >= 0.7].copy()
 
     if not buy_df.empty:
         total = buy_df["ai_predicted_probability"].sum()
@@ -47,7 +48,7 @@ def allocate_portfolio(df: pd.DataFrame) -> list:
         else:
             buy_df["allocation"] = 1.0 / len(buy_df)
         buy_df["recommendation"] = "BUY"
-        print("✅ Có mã BUY → Phân bổ theo xác suất", file=sys.stderr)
+        print("✅ Có mã xác suất cao → Phân bổ theo xác suất", file=sys.stderr)
         return buy_df[["symbol", "ai_predicted_probability", "recommendation", "allocation"]] \
             .rename(columns={"ai_predicted_probability": "probability"}) \
             .to_dict(orient="records")
@@ -56,7 +57,7 @@ def allocate_portfolio(df: pd.DataFrame) -> list:
     fallback = df.head(3).copy()
     fallback["recommendation"] = "WATCH"
     fallback["allocation"] = 1.0 / len(fallback) if len(fallback) > 0 else 0
-    print("🟡 Không có mã BUY → fallback sang WATCH", file=sys.stderr)
+    print("🟡 Không có mã đủ xác suất cao → fallback sang WATCH", file=sys.stderr)
     return fallback[["symbol", "ai_predicted_probability", "recommendation", "allocation"]] \
         .rename(columns={"ai_predicted_probability": "probability"}) \
         .to_dict(orient="records")
