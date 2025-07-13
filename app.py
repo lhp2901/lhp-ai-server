@@ -125,6 +125,9 @@ def portfolio():
             return jsonify({"error": "❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY"}), 500
 
         # 🔌 Tạo client Supabase
+        if not create_client:
+            return jsonify({ "error": "⚠️ create_client chưa được import — kiểm tra gói supabase" }), 500
+
         sb = create_client(supabase_url, supabase_key)
         print(f"✅ Supabase client created for user {user_id}")
 
