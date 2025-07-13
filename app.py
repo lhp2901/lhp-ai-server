@@ -5,12 +5,10 @@ import os
 import numpy as np
 import json
 from dotenv import load_dotenv
+from supabase import create_client
+import supabase      
+    
 
-try:
-    from supabase import create_client
-    print("✅ Đã import được create_client từ supabase")
-except Exception as e:
-    print("❌ Không import được create_client:", str(e))
 # ─────────── Load biến môi trường ───────────
 load_dotenv()
 
@@ -110,42 +108,27 @@ def predict_all():
 @app.route("/portfolio", methods=["POST"])
 def portfolio():
     try:
-        print("🔥 BẮT ĐẦU portfolio route")
-
-        # 🚨 Import ngay trong hàm để bắt lỗi sớm nhất
-        try:
-            from supabase import create_client
-            print("✅ Imported create_client thành công")
-        except Exception as ie:
-            print("❌ Import lỗi:", str(ie))
-            return jsonify({ "error": "Không import được create_client", "trace": str(ie) }), 500
-
         raw_data = request.get_json()
+
         if not raw_data or "userId" not in raw_data:
-            return jsonify({"error": "❌ Thiếu userId trong request!"}), 400
+            return jsonify({"error": "Thiếu userId!"}), 400
 
-        user_id = raw_data["userId"]
         supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-        if not supabase_url or not supabase_key:
-            return jsonify({"error": "❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY"}), 500
+        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # dùng SERVICE ROLE mới được quyền đọc toàn bộ
 
         sb = create_client(supabase_url, supabase_key)
-        print("✅ Supabase client created")
 
-        # Lấy dữ liệu
-        resp = sb.table("ai_signals").select("*") \
-            .eq("user_id", user_id) \
-            .order("date", desc=True) \
+        resp = sb.table("ai_signals").select("*")\
+            .eq("user_id", raw_data["userId"])\
+            .order("date", desc=True)\
             .execute()
 
         records = resp.data or []
-        if not records:
-            return jsonify({"error": "❌ Không có dữ liệu AI signals cho user này"}), 404
 
-        # Gọi script
-        input_json = json.dumps(records)
+        # Gọi portfolio_optimizer.py bằng subprocess
+        import subprocess
+        import json
+
         p = subprocess.Popen(
             ["python", "scripts/portfolio_optimizer.py"],
             stdin=subprocess.PIPE,
@@ -154,37 +137,23 @@ def portfolio():
             text=True
         )
 
-        stdout, stderr = p.communicate(input=input_json)
-        print("📤 STDOUT:", stdout)
-        print("📛 STDERR:", stderr)
+        stdout, stderr = p.communicate(json.dumps(records))
 
         if p.returncode != 0:
-            return jsonify({
-                "error": "❌ portfolio_optimizer.py trả lỗi",
-                "stderr": stderr.strip()
-            }), 500
+            return jsonify({ "error": "Lỗi khi chạy portfolio_optimizer", "stderr": stderr }), 500
 
         try:
             portfolio = json.loads(stdout)
-        except json.JSONDecodeError:
-            return jsonify({
-                "error": "❌ Không parse được kết quả JSON từ optimizer",
-                "raw_output": stdout
-            }), 500
+        except:
+            return jsonify({ "error": "Lỗi parse kết quả JSON từ optimizer", "raw": stdout }), 500
 
         return jsonify({
-            "date": records[0]["date"],
+            "date": records[0]["date"] if records else None,
             "portfolio": portfolio
         })
 
     except Exception as e:
-        import traceback
-        traceback_str = traceback.format_exc()
-        print("🔥 TOÀN BỘ BỊ CRASH:\n", traceback_str)
-        return jsonify({
-            "error": f"🔥 Lỗi xử lý portfolio: {str(e)}",
-            "trace": traceback_str
-        }), 500
+        return jsonify({ "error": f"Lỗi xử lý portfolio: {str(e)}" }), 500
      
 
 # ─────────── Endpoint kiểm tra ───────────
