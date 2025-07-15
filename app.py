@@ -154,7 +154,56 @@ def portfolio():
     except Exception as e:
         return jsonify({ "error": f"Lỗi xử lý portfolio: {str(e)}" }), 500
      
+# ─────────── Gọi toàn bộ pipeline AI: insert → label → evaluate ───────────
+@app.route("/run_daily", methods=["POST"])
+def run_daily():
+    try:
+        steps = [
+            ("Insert AI signals", "scripts/insert_ai_signals.py"),
+            ("Label AI signals", "scripts/label_ai_signals.py"),
+            ("Evaluate AI accuracy", "scripts/evaluate_ai_accuracy.py"),
+        ]
 
+        logs = []
+
+        for name, script in steps:
+            print(f"🚀 Đang chạy: {name} ({script})")
+            result = subprocess.run(
+                ["python", script],
+                capture_output=True,
+                text=True
+            )
+
+            log_entry = {
+                "step": name,
+                "script": script,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip(),
+                "returncode": result.returncode
+            }
+            logs.append(log_entry)
+
+            if result.returncode != 0:
+                print(f"❌ Bước thất bại: {name}")
+                return jsonify({
+                    "error": f"Lỗi khi chạy bước: {name}",
+                    "details": logs
+                }), 500
+
+        print("✅ Toàn bộ pipeline đã chạy thành công!")
+        return jsonify({
+            "message": "✅ Đã chạy toàn bộ AI pipeline thành công!",
+            "logs": logs
+        })
+
+    except Exception as e:
+        print(f"🔥 Lỗi hệ thống: {str(e)}")
+        return jsonify({
+            "error": "Lỗi hệ thống khi chạy pipeline",
+            "exception": str(e)
+        }), 500
+
+        
 # ─────────── Endpoint kiểm tra ───────────
 @app.route("/", methods=["GET"])
 def home():
