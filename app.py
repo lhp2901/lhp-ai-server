@@ -157,51 +157,60 @@ def portfolio():
 # ─────────── Gọi toàn bộ pipeline AI: insert → label → evaluate ───────────
 @app.route("/run_daily", methods=["POST"])
 def run_daily():
-    try:
-        steps = [
-            ("Insert AI signals", "scripts/insert_ai_signals.py"),
-            ("Label AI signals", "scripts/label_ai_signals.py"),
-            ("Evaluate AI accuracy", "scripts/evaluate_ai_accuracy.py"),
-        ]
+    steps = [
+        ("Insert AI signals", "scripts/insert_ai_signals.py"),
+        ("Label AI signals", "scripts/label_ai_signals.py"),
+        ("Evaluate AI accuracy", "scripts/evaluate_ai_accuracy.py"),
+    ]
 
-        logs = []
+    logs = []
 
-        for name, script in steps:
-            print(f"🚀 Đang chạy: {name} ({script})")
+    for step_name, script in steps:
+        print(f"🚀 Đang chạy: {step_name}")
+
+        try:
             result = subprocess.run(
                 ["python", script],
-                capture_output=True,
-                text=True
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace"  # ✅ chống UnicodeDecodeError
             )
 
             log_entry = {
-                "step": name,
+                "step": step_name,
                 "script": script,
-                "stdout": result.stdout.strip(),
-                "stderr": result.stderr.strip(),
-                "returncode": result.returncode
+                "returncode": result.returncode,
+                "stdout": result.stdout.strip() if result.stdout else "",
+                "stderr": result.stderr.strip() if result.stderr else "",
             }
+
             logs.append(log_entry)
 
             if result.returncode != 0:
-                print(f"❌ Bước thất bại: {name}")
                 return jsonify({
-                    "error": f"Lỗi khi chạy bước: {name}",
-                    "details": logs
+                    "error": f"Lỗi khi chạy {step_name}",
+                    "logs": logs
                 }), 500
 
-        print("✅ Toàn bộ pipeline đã chạy thành công!")
-        return jsonify({
-            "message": "✅ Đã chạy toàn bộ AI pipeline thành công!",
-            "logs": logs
-        })
+        except Exception as e:
+            logs.append({
+                "step": step_name,
+                "script": script,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": str(e),
+            })
+            return jsonify({
+                "error": f"Exception tại bước {step_name}",
+                "logs": logs
+            }), 500
 
-    except Exception as e:
-        print(f"🔥 Lỗi hệ thống: {str(e)}")
-        return jsonify({
-            "error": "Lỗi hệ thống khi chạy pipeline",
-            "exception": str(e)
-        }), 500
+    return jsonify({
+        "message": "✅ Đã hoàn thành toàn bộ pipeline AI",
+        "logs": logs
+    }), 200
 
         
 # ─────────── Endpoint kiểm tra ───────────

@@ -1,30 +1,86 @@
 import subprocess
 from datetime import datetime
 
-def run_script(path: str, description: str):
-    print(f"\n🚀 Bắt đầu {description}...")
+def run_script(path: str, description: str) -> dict:
+    print(f"\n🚀 Bắt đầu: {description}")
+    start = datetime.now()
+
     try:
-        start = datetime.now()
-        subprocess.run(["python", path], check=True)
+        result = subprocess.run(
+            ["python", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",      # 🛠 fix lỗi tiếng Việt khi đọc stdout/stderr
+            errors="replace"       # 🛡 tránh UnicodeDecodeError
+        )
+
         end = datetime.now()
-        print(f"✅ Hoàn tất {description} trong {(end - start).seconds} giây.")
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Lỗi khi chạy {description}: {e}")
+        duration = (end - start).seconds
+
+        stdout = result.stdout.strip() if result.stdout else ""
+        stderr = result.stderr.strip() if result.stderr else ""
+        returncode = result.returncode
+        success = returncode == 0
+
+        if success:
+            print(f"✅ {description} đã chạy xong sau {duration} giây.")
+        else:
+            print(f"❌ {description} lỗi (exit code {returncode})")
+            if stderr:
+                print("🧨 STDERR:\n" + stderr)
+
+        return {
+            "step": description,
+            "script": path,
+            "success": success,
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "duration": duration,
+        }
+
+    except Exception as e:
+        print(f"🔥 Exception subprocess: {e}")
+        return {
+            "step": description,
+            "script": path,
+            "success": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": str(e),
+            "duration": 0,
+        }
 
 def main():
-    print(f"📅 Chạy hệ thống AI ngày {datetime.now().strftime('%Y-%m-%d')}")
-    print("⏱️ Thực thi theo quy trình: Insert ➝ Label ➝ Evaluate")
+    print(f"\n📅 [RUN DAILY] Ngày {datetime.now().strftime('%Y-%m-%d')}")
+    print("🧠 Bắt đầu pipeline: Insert → Label → Evaluate")
 
-    # 1️⃣ Insert tín hiệu mới
-    run_script("scripts/insert_ai_signals.py", "tạo tín hiệu mới (insert_ai_signals.py)")
+    steps = [
+        ("scripts/insert_ai_signals.py", "Tạo tín hiệu mới"),
+        ("scripts/label_ai_signals.py", "Gắn nhãn thắng/thua"),
+        ("scripts/evaluate_ai_accuracy.py", "Đánh giá độ chính xác AI"),
+    ]
 
-    # 2️⃣ Gắn nhãn cho tín hiệu cũ
-    run_script("scripts/label_ai_signals.py", "gắn label cho tín hiệu cũ (label_ai_signals.py)")
+    summary = []
 
-    # 3️⃣ Đánh giá độ chính xác
-    run_script("scripts/evaluate_ai_accuracy.py", "đánh giá độ chính xác AI (evaluate_ai_accuracy.py)")
+    for path, desc in steps:
+        result = run_script(path, desc)
+        summary.append(result)
 
-    print("\n🎯 Kết thúc quy trình run_daily.py – All systems ✅ Ready to conquer the market.")
+        if not result["success"]:
+            print(f"🛑 Dừng pipeline tại bước: {desc}")
+            break
+
+    print("\n📋 Tổng kết:")
+    for step in summary:
+        status = "✅ Thành công" if step["success"] else "❌ Thất bại"
+        print(f" - {step['step']}: {status} ({step['duration']}s)")
+
+    if all(s["success"] for s in summary):
+        print("\n🎯 Toàn bộ pipeline AI đã chạy thành công! Ready to conquer the market.")
+    else:
+        print("\n⚠️ Một hoặc nhiều bước gặp lỗi. Xem log chi tiết.")
 
 if __name__ == "__main__":
     main()
