@@ -5,6 +5,8 @@ import xgboost as xgb
 import joblib
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
 
 # ✅ Unicode cho Windows terminal
 sys.stdout.reconfigure(encoding='utf-8')
@@ -48,17 +50,15 @@ def preprocess(df):
             print(f"⚠️ Thiếu cột {col} → tạo với giá trị 0")
             df[col] = 0
 
-    # ✨ Ép tạo bản sao an toàn để tránh SettingWithCopyWarning
     df = df[expected].copy()
 
-    # 🎯 Ép kiểu số cho toàn bộ cột
     for col in expected:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna()
 
-    # 🚫 Không đủ nhãn phân loại
     label_counts = df["label_win"].value_counts()
+    print(f"📊 Phân phối nhãn:\n{label_counts}")
     if len(label_counts) < 2:
         print("❌ label_win không đủ đa dạng (chỉ có 1 loại nhãn).")
         return pd.DataFrame()
@@ -69,8 +69,27 @@ def preprocess(df):
 def train_model(df):
     X = df.drop("label_win", axis=1)
     y = df["label_win"].astype(int)
-    model = xgb.XGBClassifier(n_estimators=100, max_depth=5, random_state=42)
-    model.fit(X, y)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    model = xgb.XGBClassifier(
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=42
+    )
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    print("📋 Classification Report:")
+    print(classification_report(y_test, y_pred))
+    print("🧾 Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
     return model
 
 def save_model(model):
