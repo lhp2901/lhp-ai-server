@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import joblib
 from datetime import datetime
 
-# ===== 1. Load biến môi trường =====
+# ===== 1. Load ENV =====
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -13,6 +13,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ===== 2. Cấu hình =====
 MODEL_PATH = "model/model_rf.pkl"
+CANDLE_LOOKBACK = 50
 
 # ===== 3. Load model ML =====
 def load_model():
@@ -23,7 +24,7 @@ def load_model():
     except Exception as e:
         raise Exception(f"❌ Không load được model: {e}")
 
-# ===== 4. Lấy dữ liệu gần nhất =====
+# ===== 4. Lấy dữ liệu dự đoán gần nhất =====
 def fetch_latest_data(symbol):
     try:
         res = supabase.table("training_dataset")\
@@ -40,81 +41,107 @@ def fetch_latest_data(symbol):
         print(f"❌ Lỗi fetch dữ liệu cho {symbol}: {e}")
         return None
 
-# ===== 5. Tiền xử lý =====
+# ===== 5. Lấy 50 nến để tính toán SL/TP =====
+def fetch_candles(symbol):
+    try:
+        res = supabase.table("ohlcv_data")\
+            .select("timestamp, open, high, low, close")\
+            .eq("symbol", symbol)\
+            .order("timestamp", desc=True)\
+            .limit(CANDLE_LOOKBACK)\
+            .execute()
+        return pd.DataFrame(res.data[::-1])  # đảo lại theo thời gian tăng
+    except Exception as e:
+        print(f"❌ Lỗi fetch candles cho {symbol}: {e}")
+        return pd.DataFrame()
+
+# ===== 6. Tiền xử lý =====
 def preprocess(df, model):
-    # Lấy các cột model cần
     expected_features = list(model.feature_names_in_)
-
-    # Chỉ giữ lại các cột có trong model
     df = df[[col for col in expected_features if col in df.columns]]
-
     df.fillna(0, inplace=True)
     return df
 
-# ===== 6. Mapping dự đoán =====
+# ===== 7. Dự đoán =====
 def decode_prediction(pred):
-    mapping = {1: "BUY", 0: "HOLD", -1: "SELL"}
-    return mapping.get(pred, "HOLD")
+    return {1: "BUY", 0: "HOLD", -1: "SELL"}.get(pred, "HOLD")
 
-# ===== 7. Ghi dự đoán lên Supabase =====
-def insert_prediction(symbol, timestamp, prediction, confidence=0.0, model_name="baseline_v1"):
+# ===== 8. Tính SL/TP từ hỗ trợ kháng cự =====
+def calculate_trade_levels(candles: pd.DataFrame):
+    high = candles["high"].max()
+    low = candles["low"].min()
+    current_price = candles["close"].iloc[-1]
+
+    # Kháng cự: đỉnh cũ gần nhất lớn hơn current_price
+    resistance = candles[candles["high"] > current_price]["high"].min()
+    support = candles[candles["low"] < current_price]["low"].max()
+
+    tp = resistance if not pd.isna(resistance) else high
+    sl = support if not pd.isna(support) else low
+
+    return current_price, tp, sl, high, low
+
+# ===== 9. Ghi kết quả =====
+def insert_prediction(symbol, timestamp, prediction, confidence, entry, tp, sl, high, low, current_price):
     record = {
         "symbol": symbol,
         "timestamp": int(timestamp),
         "prediction": prediction,
         "confidence": float(round(confidence, 4)),
-        "model_name": model_name,
+        "model_name": "baseline_v2",
+        "entry_price": entry,
+        "tp": tp,
+        "sl": sl,
+        "high": high,
+        "low": low,
+        "current_price": current_price,
+        "executed": False,
         "created_at": datetime.now().isoformat()
     }
+
     try:
-        # Check nếu đã tồn tại rồi thì bỏ qua hoặc cập nhật
         existing = supabase.table("ai_predictions")\
             .select("id")\
             .eq("symbol", symbol)\
             .eq("timestamp", int(timestamp))\
             .execute()
-        
-        if existing.data and len(existing.data) > 0:
-            print(f"⏭️ Bỏ qua prediction cho {symbol} lúc {timestamp} - đã tồn tại")
+        if existing.data:
+            print(f"⏭️ Prediction {symbol} tại {timestamp} đã tồn tại")
             return
-        
-        supabase.table("ai_predictions").insert(record).execute()
-        print(f"✅ Đã lưu prediction {prediction} cho {symbol} lúc {timestamp}")
-    except Exception as e:
-        print(f"⚠️ Không thể insert prediction cho {symbol}: {e}")
 
-# ===== 8. Hàm chính =====
+        supabase.table("ai_predictions").insert(record).execute()
+        print(f"✅ Lưu {prediction} cho {symbol} @ {entry}")
+    except Exception as e:
+        print(f"❌ Insert prediction lỗi: {e}")
+
+# ===== 10. Chạy chính =====
 def run():
     model = load_model()
-
-    symbols_res = supabase.table("watched_symbols").select("symbol").execute()
+    symbols_res = supabase.table("watched_symbols").select("symbol").eq("active", True).execute()
     symbols = [s["symbol"] for s in symbols_res.data]
-    print(f"📌 Bắt đầu dự đoán {len(symbols)} symbol...")
+    print(f"🚀 Chạy AI cho {len(symbols)} symbols...")
 
     for symbol in symbols:
-        print(f"\n🔍 Dự đoán cho {symbol}...")
+        print(f"\n🔍 Dự đoán {symbol}...")
         df_latest = fetch_latest_data(symbol)
         if df_latest is None or df_latest.empty:
             continue
 
+        candles = fetch_candles(symbol)
+        if candles.empty:
+            continue
+
         try:
-            X = preprocess(df_latest.copy(), model) 
+            X = preprocess(df_latest.copy(), model)
             pred = model.predict(X)[0]
-
-            # Nếu là classifier có predict_proba → dùng
-            if hasattr(model, "predict_proba"):
-                pred_proba = model.predict_proba(X)[0]
-                confidence = max(pred_proba)
-            else:
-                confidence = 1.0  # fallback nếu không có predict_proba
-
-            pred_label = decode_prediction(int(round(pred)))  # convert regressor float → int
+            confidence = max(model.predict_proba(X)[0]) if hasattr(model, "predict_proba") else 1.0
+            pred_label = decode_prediction(int(round(pred)))
             timestamp = df_latest.iloc[0]["timestamp"]
 
-            insert_prediction(symbol, timestamp, pred_label, confidence)
+            entry, tp, sl, high, low = calculate_trade_levels(candles)
+            insert_prediction(symbol, timestamp, pred_label, confidence, entry, tp, sl, high, low, entry)
         except Exception as e:
             print(f"❌ Lỗi khi predict {symbol}: {e}")
 
-# ===== 9. Chạy trực tiếp =====
 if __name__ == "__main__":
     run()
