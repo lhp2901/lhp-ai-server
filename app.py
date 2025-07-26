@@ -7,6 +7,9 @@ import json
 from dotenv import load_dotenv
 from supabase import create_client
 import supabase     
+from services.sync_bybit import run_sync
+import traceback 
+import sys
     
 # ─────────── Load biến môi trường ───────────
 load_dotenv()
@@ -212,6 +215,121 @@ def run_daily():
         "logs": logs
     }), 200
 
+@app.route("/bybit/bybit_to_supabase", methods=["POST"])
+def sync_bybit():
+    logs = []
+
+    try:
+        logs.append("📡 Nhận yêu cầu POST từ Next.js")
+        logs.append("🔄 Bắt đầu gọi hàm run_sync()...")
+
+        inserted = run_sync(logs)  # Bây giờ truyền logs vào
+
+        logs.append(f"\n🎯 Tổng cộng đã thêm {inserted} nến vào Supabase.")
+        success_msg = f"✅ Đồng bộ thành công! Đã thêm {inserted} nến."
+        logs.append(success_msg)
+
+        return jsonify({
+            'message': success_msg,
+            'logs': logs
+        })
+
+    except Exception as e:
+        error_msg = f"❌ Lỗi khi đồng bộ: {str(e)}"
+        logs.append(error_msg)
+        logs.extend(traceback.format_exc().splitlines())
+        return jsonify({ 'error': str(e), 'logs': logs }), 500
+        
+# ─────────── Gọi toàn bộ pipeline AI: insert → label → evaluate ───────────
+# Đảm bảo in được tiếng Việt và emoji ra stdout
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
+def run_script(script_filename):
+    base_dir = os.path.dirname(os.path.realpath(__file__))
+    script_path = os.path.join(base_dir, "scripts", "bybit", script_filename)  # ✅ sửa ở đây
+
+    if not os.path.isfile(script_path):
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"❌ KHÔNG TÌM THẤY FILE: {script_path}"
+        }
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True
+        )
+        return {
+            "success": True,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip()
+        }
+    except subprocess.CalledProcessError as e:
+        return {
+            "success": False,
+            "stdout": e.stdout.strip() if e.stdout else "",
+            "stderr": e.stderr.strip() if e.stderr else f"Lỗi không xác định trong {script_filename}"
+        }
+
+@app.route("/bybit/run_daily", methods=["POST"])
+def run_daily_ai():
+    stdout = []
+    stderr = []
+
+    try:
+        stdout.append("🚀 Bắt đầu chạy quy trình AI hàng ngày...")
+
+        steps = [
+            ("generate_training_data.py", "📊 Sinh dữ liệu training"),
+            ("train_model.py", "🤖 Huấn luyện mô hình"),
+            ("predict_signal.py", "🔮 Dự đoán tín hiệu"),
+            ("ai_execute_signals.py", "💥 Ghi tín hiệu vào bảng")
+        ]
+
+        for filename, description in steps:
+            stdout.append(f"\n🔄 {description} ({filename})...")
+            result = run_script(filename)
+
+            if result["success"]:
+                stdout.append(f"✅ {description} thành công.")
+                if result["stdout"]:
+                    stdout.append(result["stdout"])
+                if result["stderr"]:
+                    stdout.append(f"⚠️ Cảnh báo:\n{result['stderr']}")
+            else:
+                stderr.append(f"❌ {description} thất bại!")
+                stderr.append(result["stderr"])
+                stdout.append(result["stdout"])
+                break  # Dừng quy trình tại đây nếu lỗi
+
+        if stderr:
+            raise Exception("Một bước trong quy trình đã thất bại.")
+
+        stdout.append("\n🏁 ✅ TOÀN BỘ QUY TRÌNH ĐÃ CHẠY THÀNH CÔNG.")
+
+        return jsonify({
+            "message": "Đã chạy xong quy trình AI hàng ngày",
+            "stdout": "\n".join(stdout),
+            "stderr": ""
+        })
+
+    except Exception as e:
+        tb_lines = traceback.format_exc().splitlines()
+        error_msg = f"❌ Lỗi khi chạy quy trình AI hàng ngày: {str(e)}"
+        stderr.insert(0, error_msg)
+        stderr.extend(tb_lines)
+
+        return jsonify({
+            "error": error_msg,
+            "stdout": "\n".join(stdout),
+            "stderr": "\n".join(stderr)
+        }), 500
         
 # ─────────── Endpoint kiểm tra ───────────
 @app.route("/", methods=["GET"])
