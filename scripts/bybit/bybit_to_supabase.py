@@ -1,18 +1,21 @@
 import requests
 import os
+import sys
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
 # ====== 1. Nạp biến môi trường từ .env ======
+sys.stdout.reconfigure(encoding='utf-8')
+
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# ====== 2. Kết nối Supabase ======
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("⚠️ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong file .env!")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong .env")
+    sys.exit(1)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ====== 3. Hàm lấy danh sách symbol đang được theo dõi ======
 def get_active_symbols_from_supabase():

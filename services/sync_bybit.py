@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -6,14 +7,16 @@ from datetime import datetime
 from typing import List, Dict
 
 # ====== 1. Load biến môi trường ======
+sys.stdout.reconfigure(encoding='utf-8')
+
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise ValueError("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong file .env!")
+    print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong .env")
+    sys.exit(1)
 
-# ====== 2. Khởi tạo kết nối Supabase ======
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ====== 3. Định nghĩa hằng số ======
