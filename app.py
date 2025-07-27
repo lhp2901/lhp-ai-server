@@ -7,7 +7,7 @@ import json
 from dotenv import load_dotenv
 from supabase import create_client
 import supabase     
-from services.sync_bybit import run_sync
+from scripts.bybit.bybit_to_supabase import run_sync
 import traceback 
 import sys
     
@@ -223,7 +223,7 @@ def sync_bybit():
         logs.append("📡 Nhận yêu cầu POST từ Next.js")
         logs.append("🔄 Bắt đầu gọi hàm run_sync()...")
 
-        inserted = run_sync(logs)  # Bây giờ truyền logs vào
+        inserted = run_sync(logs)  # Truyền logs để ghi chi tiết quá trình
 
         logs.append(f"\n🎯 Tổng cộng đã thêm {inserted} nến vào Supabase.")
         success_msg = f"✅ Đồng bộ thành công! Đã thêm {inserted} nến."
