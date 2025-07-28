@@ -48,46 +48,79 @@ def fetch_ohlcv(symbol: str) -> pd.DataFrame:
 # ===== 4. Tính chỉ báo kỹ thuật & target =====
 def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     try:
+        from sklearn.preprocessing import StandardScaler
+
         df = df.copy()
+
+        # ===== 1. Tính chỉ báo kỹ thuật từ TA-Lib
         df = add_all_ta_features(
             df,
             open="open", high="high", low="low", close="close", volume="volume",
             fillna=True
         )
 
-        df["future_close"] = df["close"].shift(-3)
-        df["target"] = "hold"
-        df.loc[df["future_close"] > df["close"] * 1.002, "target"] = "buy"
-        df.loc[df["future_close"] < df["close"] * 0.998, "target"] = "sell"
+        # ===== 2. Target: Xác định hành vi giá trong 3 nến tiếp theo (t+1, t+2, t+3)
+        n_future = 3
 
-        # Các feature bổ sung sẽ được tạo 1 lần rồi concat vào dataframe
-        new_features = pd.DataFrame({
-            "ema_cross": (df["trend_ema_fast"] > df["trend_ema_slow"]).astype(int),
-            "signal": df["target"].map({"buy": 1, "sell": -1}).fillna(0).astype(int),
-            "bb_width_pct": ((df["volatility_bbh"] - df["volatility_bbl"]) / df["volatility_bbm"]).fillna(0),
+        # Lấy max/min của 3 nến tiếp theo, bắt đầu từ t+1
+        df["future_max"] = df["high"].shift(-1).rolling(window=n_future).max()
+        df["future_min"] = df["low"].shift(-1).rolling(window=n_future).min()
+
+        # Gán nhãn dự đoán
+        df["target"] = "hold"
+        df.loc[
+            (df["future_max"] > df["close"] * 1.002) & (df["future_min"] > df["close"] * 0.998),
+            "target"
+        ] = "buy"
+        df.loc[
+            (df["future_min"] < df["close"] * 0.998) & (df["future_max"] < df["close"] * 1.002),
+            "target"
+        ] = "sell"
+
+        # ===== 3. Tạo các đặc trưng kỹ thuật bổ sung
+        features = {
             "volume_change_pct": df["volume"].pct_change().fillna(0),
             "price_change_pct": df["close"].pct_change().fillna(0),
             "candle_body": abs(df["close"] - df["open"]),
             "upper_wick": df["high"] - df[["close", "open"]].max(axis=1),
             "lower_wick": df[["close", "open"]].min(axis=1) - df["low"],
-            "volume_spike": (df["volume"] > df["volume"].rolling(20).mean() * 1.5).astype(bool),
+            "volume_spike": (df["volume"] > df["volume"].rolling(20).mean() * 1.5).astype(int),
             "rsi_reversal": ((df["momentum_rsi"] < 30) | (df["momentum_rsi"] > 70)).astype(int),
             "macd_divergence": df["trend_macd"] - df["trend_macd_signal"],
             "reversal_candle": (
-                (abs(df["close"] - df["open"]) > (df["high"] - df[["close", "open"]].max(axis=1) +
-                                                  df[["close", "open"]].min(axis=1) - df["low"])) &
+                (abs(df["close"] - df["open"]) >
+                 (df["high"] - df[["close", "open"]].max(axis=1) +
+                  df[["close", "open"]].min(axis=1) - df["low"])) &
                 ((df["high"] - df[["close", "open"]].max(axis=1)) > abs(df["close"] - df["open"]) * 0.5)
             ).astype(int),
+            "ema_cross": (df["trend_ema_fast"] > df["trend_ema_slow"]).astype(int),
             "hour_of_day": df.index.hour,
             "day_of_week": df.index.dayofweek,
-        })
+            "bb_width_pct": ((df["volatility_bbh"] - df["volatility_bbl"]) / df["volatility_bbm"]).fillna(0),
+        }
 
-        df = pd.concat([df, new_features], axis=1).copy()
+        df = pd.concat([df, pd.DataFrame(features, index=df.index)], axis=1)
+
+        # ===== 4. Chuyển target sang tín hiệu số
+        df["signal"] = df["target"].map({"buy": 1, "sell": -1}).fillna(0).astype(int)
+
+        # ===== 5. Lọc rác
+        df = df[df["volume"] > 100]
+        df = df[df["volume_change_pct"].abs() < 10]
         df.dropna(inplace=True)
+
+        # ===== 6. Chuẩn hóa numeric columns (trừ target/signal)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.drop("signal", errors="ignore")
+        scaler = StandardScaler()
+        df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+        df[numeric_cols] = df[numeric_cols].astype(float)
+
         return df
+
     except Exception as e:
         print(f"❌ Lỗi khi tính chỉ báo kỹ thuật: {e}")
         return pd.DataFrame()
+
 
 # ===== 5. Ghi vào bảng training_dataset =====
 def insert_training_data(symbol: str, df: pd.DataFrame):
