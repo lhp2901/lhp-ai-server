@@ -1,5 +1,3 @@
-# bybit_to_supabase.py
-
 import requests
 import os
 import sys
@@ -20,35 +18,35 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# ====== 2. Cấu hình Bybit API ======
+# ====== 2. Cấu hình mặc định ======
 BYBIT_API_URL = "https://api.bybit.com/v5/market/kline"
-INTERVAL = "5"
-LIMIT = 100
 CATEGORY = "linear"
+DEFAULT_INTERVAL = "5"
+DEFAULT_LIMIT = 100
 
 # ====== 3. Hàm in log có timestamp ======
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-# ====== 4. Lấy danh sách coin đang theo dõi ======
+# ====== 4. Lấy danh sách symbol đang theo dõi kèm interval & candle_limit ======
 def get_active_symbols():
     try:
         res = supabase.table("watched_symbols") \
-                      .select("symbol") \
+                      .select("symbol, interval, candle_limit") \
                       .eq("active", True) \
                       .execute()
-        return [row["symbol"] for row in res.data]
+        return res.data or []
     except Exception as e:
         log(f"❌ Lỗi khi lấy danh sách coin: {e}")
         return []
 
 # ====== 5. Lấy dữ liệu nến từ Bybit ======
-def fetch_candles(symbol: str):
+def fetch_candles(symbol: str, interval: str, limit: int):
     params = {
         "category": CATEGORY,
         "symbol": symbol,
-        "interval": INTERVAL,
-        "limit": LIMIT
+        "interval": interval,
+        "limit": limit
     }
     try:
         response = requests.get(BYBIT_API_URL, params=params, timeout=10)
@@ -111,10 +109,14 @@ def run_sync(logs=None):
         log(msg)
         return 0
 
-    for symbol in symbols:
+    for item in symbols:
+        symbol = item.get("symbol")
+        interval = item.get("interval") or DEFAULT_INTERVAL
+        limit = item.get("candle_limit") or DEFAULT_LIMIT
+
         try:
-            logs.append(f"\n📥 Đang xử lý {symbol}...")
-            candles = fetch_candles(symbol)
+            logs.append(f"\n📥 Đang xử lý {symbol} ({interval} - {limit} nến)...")
+            candles = fetch_candles(symbol, interval, limit)
             logs.append(f"🟢 Lấy được {len(candles)} cây nến từ Bybit.")
             count = save_to_supabase(symbol, candles)
             logs.append(f"✅ Đã lưu {count} cây nến mới vào Supabase.")

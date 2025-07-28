@@ -1,4 +1,5 @@
 import os
+import sys
 import pandas as pd
 import numpy as np
 from supabase import create_client, Client
@@ -6,10 +7,16 @@ from ta import add_all_ta_features
 from dotenv import load_dotenv
 from datetime import datetime
 
-# ===== 1. Load biến môi trường =====
+# ====== 1. Nạp biến môi trường từ .env ======
+sys.stdout.reconfigure(encoding='utf-8')
 load_dotenv()
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    print("❌ Thiếu SUPABASE_URL hoặc SUPABASE_SERVICE_ROLE_KEY trong .env")
+    sys.exit(1)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -47,13 +54,35 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
             open="open", high="high", low="low", close="close", volume="volume",
             fillna=True
         )
-        df["future_close"] = df["close"].shift(-3)
 
-        # Gán target: BUY nếu future_close > close * 1.002, SELL nếu < close * 0.998, còn lại là HOLD
+        df["future_close"] = df["close"].shift(-3)
         df["target"] = "hold"
         df.loc[df["future_close"] > df["close"] * 1.002, "target"] = "buy"
         df.loc[df["future_close"] < df["close"] * 0.998, "target"] = "sell"
 
+        # Các feature bổ sung sẽ được tạo 1 lần rồi concat vào dataframe
+        new_features = pd.DataFrame({
+            "ema_cross": (df["trend_ema_fast"] > df["trend_ema_slow"]).astype(int),
+            "signal": df["target"].map({"buy": 1, "sell": -1}).fillna(0).astype(int),
+            "bb_width_pct": ((df["volatility_bbh"] - df["volatility_bbl"]) / df["volatility_bbm"]).fillna(0),
+            "volume_change_pct": df["volume"].pct_change().fillna(0),
+            "price_change_pct": df["close"].pct_change().fillna(0),
+            "candle_body": abs(df["close"] - df["open"]),
+            "upper_wick": df["high"] - df[["close", "open"]].max(axis=1),
+            "lower_wick": df[["close", "open"]].min(axis=1) - df["low"],
+            "volume_spike": (df["volume"] > df["volume"].rolling(20).mean() * 1.5).astype(bool),
+            "rsi_reversal": ((df["momentum_rsi"] < 30) | (df["momentum_rsi"] > 70)).astype(int),
+            "macd_divergence": df["trend_macd"] - df["trend_macd_signal"],
+            "reversal_candle": (
+                (abs(df["close"] - df["open"]) > (df["high"] - df[["close", "open"]].max(axis=1) +
+                                                  df[["close", "open"]].min(axis=1) - df["low"])) &
+                ((df["high"] - df[["close", "open"]].max(axis=1)) > abs(df["close"] - df["open"]) * 0.5)
+            ).astype(int),
+            "hour_of_day": df.index.hour,
+            "day_of_week": df.index.dayofweek,
+        })
+
+        df = pd.concat([df, new_features], axis=1).copy()
         df.dropna(inplace=True)
         return df
     except Exception as e:
@@ -75,7 +104,7 @@ def insert_training_data(symbol: str, df: pd.DataFrame):
                 "volume": float(row["volume"]),
                 "ema_20": float(row.get("trend_ema_slow", 0)),
                 "ema_50": float(row.get("trend_ema_fast", 0)),
-                "ema_cross": int(row.get("trend_ema_fast", 0) > row.get("trend_ema_slow", 0)),
+                "ema_cross": int(row.get("ema_cross", 0)),
                 "rsi": float(row.get("momentum_rsi", 0)),
                 "macd": float(row.get("trend_macd", 0)),
                 "macd_signal": float(row.get("trend_macd_signal", 0)),
@@ -83,12 +112,23 @@ def insert_training_data(symbol: str, df: pd.DataFrame):
                 "bb_lower": float(row.get("volatility_bbl", 0)),
                 "bb_middle": float(row.get("volatility_bbm", 0)),
                 "bb_upper": float(row.get("volatility_bbh", 0)),
+                "bb_width_pct": float(row.get("bb_width_pct", 0)),
+                "volume_change_pct": float(row.get("volume_change_pct", 0)),
+                "price_change_pct": float(row.get("price_change_pct", 0)),
+                "candle_body": float(row.get("candle_body", 0)),
+                "upper_wick": float(row.get("upper_wick", 0)),
+                "lower_wick": float(row.get("lower_wick", 0)),
+                "volume_spike": bool(row.get("volume_spike", False)),
+                "rsi_reversal": int(row.get("rsi_reversal", 0)),
+                "macd_divergence": float(row.get("macd_divergence", 0)),
+                "reversal_candle": int(row.get("reversal_candle", 0)),
+                "hour_of_day": int(row.get("hour_of_day", 0)),
+                "day_of_week": int(row.get("day_of_week", 0)),
                 "target": row.get("target", "hold"),
-                "signal": 1 if row.get("target") == "buy" else (-1 if row.get("target") == "sell" else 0),
+                "signal": int(row.get("signal", 0)),
                 "created_at": datetime.utcnow().isoformat()
             }
 
-            # Check trùng trước khi insert
             existing = supabase.table("training_dataset") \
                 .select("id") \
                 .eq("timestamp", record["timestamp"]) \

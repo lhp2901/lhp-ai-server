@@ -10,7 +10,7 @@ import supabase
 from scripts.bybit.bybit_to_supabase import run_sync
 import traceback 
 import sys
-    
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))    
 # ─────────── Load biến môi trường ───────────
 load_dotenv()
 
