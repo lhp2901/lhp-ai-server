@@ -111,9 +111,12 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
 
         # ===== 6. Chuẩn hóa numeric columns (trừ target/signal)
         numeric_cols = df.select_dtypes(include=[np.number]).columns.drop("signal", errors="ignore")
+        exclude_cols = ["open", "high", "low", "close", "volume"]
+        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
+
         scaler = StandardScaler()
-        df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
-        df[numeric_cols] = df[numeric_cols].astype(float)
+        df[feature_cols] = scaler.fit_transform(df[feature_cols])
+        df[feature_cols] = df[feature_cols].astype(float)
 
         return df
 

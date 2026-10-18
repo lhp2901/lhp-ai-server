@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import numpy as np
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import joblib
@@ -15,7 +16,15 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # ===== 2. Cấu hình =====
 MODEL_PATH = "model/model_rf.pkl"
 SCALER_PATH = "model/scaler.pkl"
-CANDLE_LOOKBACK = 50
+def get_tp_sl_lookback(symbol):
+    """
+    Tự động điều chỉnh số nến dùng để tính TP/SL dựa vào khung thời gian.
+    Ví dụ: 'BTCUSDT_1h', 'ETHUSDT_15m'
+    """
+    if "_1h" in symbol or "_4h" in symbol or "_D" in symbol:
+        return 100
+    else:
+        return 50
 
 # ===== 3. Load model ML & scaler =====
 def load_model_and_scaler():
@@ -47,13 +56,16 @@ def fetch_latest_data(symbol):
 # ===== 5. Lấy 50 nến để tính toán SL/TP =====
 def fetch_candles(symbol):
     try:
+        candle_lookback = get_tp_sl_lookback(symbol)
         res = supabase.table("ohlcv_data")\
             .select("timestamp, open, high, low, close")\
             .eq("symbol", symbol)\
             .order("timestamp", desc=True)\
-            .limit(CANDLE_LOOKBACK)\
+            .limit(candle_lookback)\
             .execute()
-        return pd.DataFrame(res.data[::-1])  # đảo lại theo thời gian tăng
+        df = pd.DataFrame(res.data[::-1])
+        print(f"🕯️ {symbol}: Lấy {len(df)} nến để tính TP/SL")
+        return df
     except Exception as e:
         print(f"❌ Lỗi fetch candles cho {symbol}: {e}")
         return pd.DataFrame()
@@ -71,12 +83,6 @@ def decode_prediction(pred):
     return {1: "BUY", 0: "HOLD", -1: "SELL"}.get(pred, "HOLD")
 
 # ===== 8. Tính SL/TP từ hỗ trợ kháng cự =====
-import numpy as np
-import pandas as pd
-from datetime import datetime
-# Giả sử đã import: supabase, joblib, model, scaler, v.v.
-
-# ===== 1. Tính TP/SL thông minh dựa trên ATR =====
 def calculate_trade_levels(
     candles: pd.DataFrame, 
     entry_price: float, 
