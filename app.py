@@ -23,17 +23,22 @@ load_dotenv()
 # ─────────── Khởi tạo Flask ───────────
 app = Flask(__name__)
 
+# Cho phép frontend gọi API Footprint
 CORS(
     app,
     resources={
-        r"/api/footprint/*": {
+        r"/api/footprint(?:/.*)?": {
             "origins": [
                 "http://localhost:3000",
                 "https://lhp-fi.vercel.app",
-            ]
+            ],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
         }
     },
 )
+
+# Đăng ký Blueprint sau khi khởi tạo app
 app.register_blueprint(footprint_bp)
 
 # ─────────── Load mô hình AI ───────────
