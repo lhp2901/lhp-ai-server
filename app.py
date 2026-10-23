@@ -8,6 +8,12 @@ from dotenv import load_dotenv
 from supabase import create_client
 import supabase     
 from scripts.bybit.bybit_to_supabase import run_sync
+from scripts.footprint.routes import (
+    footprint_bp,
+    start_stream_if_enabled,
+)
+from flask_cors import CORS
+
 import traceback 
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))    
@@ -16,6 +22,19 @@ load_dotenv()
 
 # ─────────── Khởi tạo Flask ───────────
 app = Flask(__name__)
+
+CORS(
+    app,
+    resources={
+        r"/api/footprint/*": {
+            "origins": [
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+            ]
+        }
+    },
+)
+app.register_blueprint(footprint_bp)
 
 # ─────────── Load mô hình AI ───────────
 MODEL_PATH = os.getenv("MODEL_PATH", "model/model.pkl")
