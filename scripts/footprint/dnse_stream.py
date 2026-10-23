@@ -32,7 +32,7 @@ import logging
 import math
 import threading
 import time
-
+from dnse import TradingClient
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
