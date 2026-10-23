@@ -20,12 +20,11 @@ requests==2.31.0
 python-dotenv==1.0.0
 
 # ============================
-# ✅ Supabase Client
+# Supabase Client
 # ============================
-supabase==1.0.3
+supabase>=2.0.0,<3.0.0
 
 # ============================
 # DNSE Open API - Footprint
 # ============================
 dnse==0.5.0
-dnse-sdk-openapi==2.4.1
