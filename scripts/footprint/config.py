@@ -200,35 +200,45 @@ def _env_csv(
     return values
 
 
+
 # ============================================================
 # 4. THÔNG TIN XÁC THỰC DNSE
 # ============================================================
 
-# Không ghi API key hoặc API secret trực tiếp trong file này.
-# Khai báo chúng trong .env ở thư mục gốc lhp-ai-server.
+# Ưu tiên biến môi trường; không ghi API key/secret trực tiếp
+# vào source code.
+DNSE_API_KEY = str(
+    _env_string("DNSE_API_KEY", "") or ""
+).strip()
 
-DNSE_API_KEY = _env_string("DNSE_API_KEY")
+DNSE_API_SECRET = str(
+    _env_string("DNSE_API_SECRET", "") or ""
+).strip()
 
-DNSE_API_SECRET = _env_string("DNSE_API_SECRET")
-
-# Tên biến tương thích nếu một module khác cần dùng.
+# Tên biến tương thích với những module cũ.
 DNSE_KEY = DNSE_API_KEY
 DNSE_SECRET = DNSE_API_SECRET
 
-
-# ============================================================
-# 5. CẤU HÌNH KẾT NỐI STREAM
-# ============================================================
-
-# URL dưới đây là giá trị cấu hình tham khảo.
-# Cần xác minh URL WebSocket chính xác theo SDK/API DNSE
-# mà bạn đang dùng; không mặc định URL này chắc chắn đúng.
-DNSE_WS_URL = _env_string(
-    "DNSE_WS_URL",
-    "wss://ws-openapi.dnse.com.vn",
+# Kiểm tra cấu hình xác thực mà không in thông tin bí mật.
+DNSE_CREDENTIALS_CONFIGURED = bool(
+    DNSE_API_KEY and DNSE_API_SECRET
 )
 
-# Thời gian chờ giữa các lần thử kết nối lại, tính bằng giây.
+
+# ============================================================
+# 5. CẤU HÌNH KẾT NỐI DNSE STREAM
+# ============================================================
+
+# URL WebSocket có thể ghi đè bằng biến môi trường.
+# Giá trị mặc định phải khớp với endpoint mà SDK DNSE đang sử dụng.
+DNSE_WS_URL = str(
+    _env_string(
+        "DNSE_WS_URL",
+        "wss://ws-openapi.dnse.com.vn",
+    ) or "wss://ws-openapi.dnse.com.vn"
+).strip().rstrip("/")
+
+# Thời gian chờ trước lần kết nối lại tiếp theo.
 DNSE_RECONNECT_BASE_SECONDS = _env_int(
     "DNSE_RECONNECT_BASE_SECONDS",
     2,
@@ -236,7 +246,7 @@ DNSE_RECONNECT_BASE_SECONDS = _env_int(
     maximum=60,
 )
 
-# Giới hạn thời gian chờ tối đa khi tăng dần thời gian reconnect.
+# Giới hạn thời gian chờ khi tăng dần thời gian kết nối lại.
 DNSE_RECONNECT_MAX_SECONDS = _env_int(
     "DNSE_RECONNECT_MAX_SECONDS",
     60,
@@ -244,7 +254,7 @@ DNSE_RECONNECT_MAX_SECONDS = _env_int(
     maximum=600,
 )
 
-# Timeout kết nối, nếu SDK có hỗ trợ cấu hình này.
+# Timeout kết nối WebSocket, tính bằng giây.
 DNSE_CONNECT_TIMEOUT_SECONDS = _env_int(
     "DNSE_CONNECT_TIMEOUT_SECONDS",
     15,
@@ -252,11 +262,12 @@ DNSE_CONNECT_TIMEOUT_SECONDS = _env_int(
     maximum=120,
 )
 
-# Bật/tắt tự động kết nối lại khi stream bị gián đoạn.
+# Bật tự động kết nối lại khi stream bị gián đoạn.
 DNSE_AUTO_RECONNECT = _env_bool(
     "DNSE_AUTO_RECONNECT",
     True,
 )
+
 
 
 # ============================================================
