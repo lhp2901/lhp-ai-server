@@ -1,0 +1,57 @@
+{
+  "success": false,
+  "started_at": "2026-10-25T05:25:55.981578+00:00",
+  "finished_at": "2026-10-25T05:26:17.389368+00:00",
+  "targets": [
+    "vnindex",
+    "vn30",
+    "stocks"
+  ],
+  "from_date": "2026-09-25",
+  "to_date": "2026-10-25",
+  "dry_run": false,
+  "fetched": 0,
+  "written": 0,
+  "skipped": 0,
+  "failed": 3,
+  "results": [
+    {
+      "target": "vnindex",
+      "symbol": "VNINDEX",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "dictionary update sequence element #0 has length 1; 2 is required",
+      "started_at": "2026-10-25T05:25:56.375053+00:00",
+      "finished_at": "2026-10-25T05:26:03.382895+00:00"
+    },
+    {
+      "target": "vn30",
+      "symbol": "VN30",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "dictionary update sequence element #0 has length 1; 2 is required",
+      "started_at": "2026-10-25T05:26:03.382895+00:00",
+      "finished_at": "2026-10-25T05:26:10.386712+00:00"
+    },
+    {
+      "target": "stocks",
+      "symbol": "FPT",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "dictionary update sequence element #0 has length 1; 2 is required",
+      "started_at": "2026-10-25T05:26:10.386712+00:00",
+      "finished_at": "2026-10-25T05:26:17.389368+00:00"
+    }
+  ],
+  "errors": [
+    "vnindex/VNINDEX: dictionary update sequence element #0 has length 1; 2 is required",
+    "vn30/VN30: dictionary update sequence element #0 has length 1; 2 is required",
+    "stocks/FPT: dictionary update sequence element #0 has length 1; 2 is required"
+  ]
+}

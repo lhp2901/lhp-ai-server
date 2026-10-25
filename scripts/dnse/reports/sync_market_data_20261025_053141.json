@@ -1,0 +1,93 @@
+{
+  "success": false,
+  "started_at": "2026-10-25T05:30:59.341506+00:00",
+  "finished_at": "2026-10-25T05:31:41.658264+00:00",
+  "targets": [
+    "vnindex",
+    "vn30",
+    "stocks"
+  ],
+  "from_date": "2026-09-25",
+  "to_date": "2026-10-25",
+  "dry_run": false,
+  "fetched": 0,
+  "written": 0,
+  "skipped": 0,
+  "failed": 6,
+  "results": [
+    {
+      "target": "vnindex",
+      "symbol": "VNINDEX",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+      "started_at": "2026-10-25T05:30:59.632479+00:00",
+      "finished_at": "2026-10-25T05:31:06.636191+00:00"
+    },
+    {
+      "target": "vn30",
+      "symbol": "VN30",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+      "started_at": "2026-10-25T05:31:06.636191+00:00",
+      "finished_at": "2026-10-25T05:31:13.638659+00:00"
+    },
+    {
+      "target": "stocks",
+      "symbol": "DXG",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+      "started_at": "2026-10-25T05:31:13.638659+00:00",
+      "finished_at": "2026-10-25T05:31:20.643183+00:00"
+    },
+    {
+      "target": "stocks",
+      "symbol": "HPG",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+      "started_at": "2026-10-25T05:31:20.643183+00:00",
+      "finished_at": "2026-10-25T05:31:27.650279+00:00"
+    },
+    {
+      "target": "stocks",
+      "symbol": "FPT",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+      "started_at": "2026-10-25T05:31:27.650279+00:00",
+      "finished_at": "2026-10-25T05:31:34.653125+00:00"
+    },
+    {
+      "target": "stocks",
+      "symbol": "SSI",
+      "success": false,
+      "fetched": 0,
+      "written": 0,
+      "skipped": 0,
+      "error": "DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+      "started_at": "2026-10-25T05:31:34.653125+00:00",
+      "finished_at": "2026-10-25T05:31:41.658264+00:00"
+    }
+  ],
+  "errors": [
+    "vnindex/VNINDEX: DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+    "vn30/VN30: DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+    "stocks/DXG: DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+    "stocks/HPG: DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+    "stocks/FPT: DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'",
+    "stocks/SSI: DNSEClient.get_ohlc() missing 1 required positional argument: 'bar_type'"
+  ]
+}

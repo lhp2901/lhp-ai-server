@@ -12,6 +12,7 @@ from scripts.footprint.routes import (
     footprint_bp,
     start_stream_if_enabled,
 )
+from scripts.dnse.sync_market_data import dnse_sync_bp
 from flask_cors import CORS
 
 import traceback 
@@ -34,13 +35,21 @@ CORS(
             ],
             "methods": ["GET", "POST", "OPTIONS"],
             "allow_headers": ["Content-Type", "Authorization"],
-        }
+        },
+        r"/api/dnse(?:/.*)?": {
+            "origins": [
+                "http://localhost:3000",
+                "https://lhp-fi.vercel.app",
+            ],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+        },
     },
 )
 
 # Đăng ký Blueprint sau khi khởi tạo app
 app.register_blueprint(footprint_bp)
-
+app.register_blueprint(dnse_sync_bp)
 # ─────────── Load mô hình AI ───────────
 MODEL_PATH = os.getenv("MODEL_PATH", "model/model.pkl")
 model = None
