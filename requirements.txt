@@ -28,3 +28,4 @@ supabase>=2.0.0,<3.0.0
 # DNSE Open API - Footprint
 # ============================
 dnse-sdk-openapi==2.4.1
+msgpack
