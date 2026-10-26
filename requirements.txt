@@ -27,4 +27,4 @@ supabase>=2.0.0,<3.0.0
 # ============================
 # DNSE Open API - Footprint
 # ============================
-dnse==0.5.0
+dnse-sdk-openapi==2.4.1
