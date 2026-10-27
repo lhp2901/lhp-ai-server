@@ -635,3 +635,68 @@ def log_config_summary() -> None:
 # Chỉ ghi log nếu người vận hành bật FOOTPRINT_LOG_LEVEL=DEBUG.
 if FOOTPRINT_LOG_LEVEL <= logging.DEBUG:
     log_config_summary()
+
+# ============================================================
+# 14. CẤU HÌNH VOLUME PROFILE
+# ============================================================
+
+# Tỷ lệ khối lượng dùng để xác định Value Area.
+FOOTPRINT_VALUE_AREA_PERCENT = _env_int(
+    "FOOTPRINT_VALUE_AREA_PERCENT",
+    70,
+    minimum=50,
+    maximum=99,
+)
+
+# Số mức giá tối đa hiển thị trong Volume Profile.
+FOOTPRINT_VOLUME_PROFILE_MAX_LEVELS = _env_int(
+    "FOOTPRINT_VOLUME_PROFILE_MAX_LEVELS",
+    500,
+    minimum=10,
+    maximum=50000,
+)
+
+# Cách tổng hợp Volume Profile:
+# SESSION: toàn bộ phiên giao dịch
+# WINDOW: một cửa sổ thời gian do engine xác định
+FOOTPRINT_VOLUME_PROFILE_MODE = _env_string(
+    "FOOTPRINT_VOLUME_PROFILE_MODE",
+    "SESSION",
+).upper()
+
+if FOOTPRINT_VOLUME_PROFILE_MODE not in {"SESSION", "WINDOW"}:
+    logger.warning(
+        "FOOTPRINT_VOLUME_PROFILE_MODE không hợp lệ; "
+        "sử dụng SESSION."
+    )
+    FOOTPRINT_VOLUME_PROFILE_MODE = "SESSION"
+
+
+# ============================================================
+# 15. CẤU HÌNH CẢNH BÁO ORDER FLOW
+# ============================================================
+
+# Ngưỡng mất cân bằng khối lượng giữa hai phía.
+# Đây là ngưỡng phát hiện ban đầu, không phải xác suất thắng.
+FOOTPRINT_IMBALANCE_RATIO = _env_int(
+    "FOOTPRINT_IMBALANCE_RATIO",
+    300,
+    minimum=100,
+    maximum=1000,
+) / 100.0
+
+# Số lần liên tiếp xác nhận điều kiện trước khi cảnh báo.
+FOOTPRINT_ALERT_CONFIRMATIONS = _env_int(
+    "FOOTPRINT_ALERT_CONFIRMATIONS",
+    2,
+    minimum=1,
+    maximum=20,
+)
+
+# Thời gian tối thiểu giữa hai cảnh báo cùng loại, tính bằng giây.
+FOOTPRINT_ALERT_COOLDOWN_SECONDS = _env_int(
+    "FOOTPRINT_ALERT_COOLDOWN_SECONDS",
+    60,
+    minimum=0,
+    maximum=3600,
+)

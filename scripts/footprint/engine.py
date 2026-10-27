@@ -1,26 +1,42 @@
+
 """
 DNSE Footprint Engine
 =====================
 
-Engine tổng hợp dữ liệu giao dịch thành dữ liệu Footprint.
+Kiến trúc:
+    DNSE Stream
+        -> FootprintEngine.add_trade()
+        -> LocalStore (SQLite)
+        -> RAM Aggregation
+        -> Flask API / Next.js
 
-Các chức năng chính:
-1. Nhận dữ liệu giao dịch từ DNSE.
-2. Chuẩn hóa symbol, price, volume, side và timestamp.
-3. Tổng hợp volume theo từng mức giá.
-4. Phân loại buy/sell/unknown volume.
-5. Tính Delta và Cumulative Delta khi có đủ thông tin.
-6. Xác định Point of Control (POC).
-7. Tổng hợp nến OHLCV.
-8. Lưu trade tape trong RAM.
-9. Hạn chế bản ghi trùng bằng trade ID.
-10. Cung cấp dữ liệu cho Flask API.
+Quy ước:
+    - timestamp nội bộ: Unix epoch tính bằng giây.
+    - timestamp lưu trong LocalStore: Unix epoch tính bằng mili giây.
+    - volume: khối lượng giao dịch dương.
+    - side: BUY / SELL / UNKNOWN.
+    - Delta chỉ được xác nhận khi không có UNKNOWN volume.
+    - Engine không tự suy luận aggressor side từ biến động giá.
+
+Tương thích:
+    - add_trade()
+    - add_trades()
+    - get_footprint()
+    - get_trades()
+    - get_candles()
+    - get_symbols()
+    - get_status()
+    - clear_symbol()
+    - reset()
 
 Lưu ý:
-- Dữ liệu được lưu trong RAM, không tự ghi vào Supabase.
-- Khởi động lại tiến trình sẽ làm mất dữ liệu trong RAM.
-- BUY/SELL phải dựa trên định nghĩa side chính xác của DNSE.
-- Engine không thể tự tạo ra dữ liệu Bid/Ask nếu nguồn không cung cấp.
+    - SQLite persistence là tùy chọn.
+    - Khi bật persistence, LocalStore phải cung cấp save_trade(),
+      load_trades() và get_storage_status().
+    - Chỉ một tầng trong pipeline nên chịu trách nhiệm ghi SQLite.
+      Mặc định engine_persists_trades=True.
+      Nếu dnse_stream.py tự ghi SQLite trước khi gọi engine,
+      hãy cấu hình engine_persists_trades=False để tránh ghi lặp.
 """
 
 from __future__ import annotations
@@ -40,7 +56,7 @@ logger = logging.getLogger("lhp_ai_server.footprint.engine")
 
 
 # ============================================================
-# 1. ĐỌC CẤU HÌNH
+# 1. CONFIG
 # ============================================================
 
 try:
@@ -59,8 +75,6 @@ try:
     )
 
 except ImportError:
-    # Giá trị dự phòng giúp module có thể được import trong môi trường
-    # thử nghiệm. Trong dự án thật, nên sử dụng scripts/footprint/config.py.
     FOOTPRINT_MAX_TRADES = 20000
     FOOTPRINT_CANDLE_SECONDS = 60
     FOOTPRINT_MAX_CANDLES = 500
@@ -76,32 +90,15 @@ except ImportError:
 
 
 # ============================================================
-# 2. HÀM CHUẨN HÓA DỮ LIỆU
+# 2. NORMALIZATION HELPERS
 # ============================================================
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
-    """
-    Chuyển dữ liệu số thành Decimal để hạn chế sai số số thực.
-
-    Chấp nhận:
-        12500
-        12500.5
-        "12500"
-        "12500.50"
-
-    Không chấp nhận:
-        None
-        ""
-        "abc"
-        NaN
-        Infinity
-    """
     if value is None or isinstance(value, bool):
         return None
 
     try:
         result = Decimal(str(value).strip())
-
     except (InvalidOperation, ValueError, TypeError):
         return None
 
@@ -112,27 +109,29 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
 
 
 def _to_float(value: Any) -> Optional[float]:
-    """Chuyển giá trị số thành float nếu hợp lệ."""
-    number = _to_decimal(value)
+    value_decimal = _to_decimal(value)
 
-    if number is None:
+    if value_decimal is None:
         return None
 
-    return float(number)
+    result = float(value_decimal)
+
+    if not math.isfinite(result):
+        return None
+
+    return result
 
 
 def _to_positive_float(value: Any) -> Optional[float]:
-    """Chỉ chấp nhận số thực lớn hơn 0."""
-    number = _to_float(value)
+    result = _to_float(value)
 
-    if number is None or number <= 0:
+    if result is None or result <= 0:
         return None
 
-    return number
+    return result
 
 
 def _normalize_symbol(value: Any) -> Optional[str]:
-    """Chuẩn hóa mã chứng khoán."""
     if value is None:
         return None
 
@@ -141,32 +140,33 @@ def _normalize_symbol(value: Any) -> Optional[str]:
     if not symbol:
         return None
 
+    # Không cho phép mã chứa khoảng trắng.
+    if any(char.isspace() for char in symbol):
+        return None
+
     return symbol
 
 
+def _first_value(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = data.get(key)
+
+        if value is not None and value != "":
+            return value
+
+    return None
+
+
 def _normalize_side(value: Any) -> str:
-    """
-    Chuẩn hóa bên giao dịch.
+    unknown = str(FOOTPRINT_UNKNOWN_SIDE_LABEL or "UNKNOWN").upper()
 
-    Trả về một trong:
-        BUY
-        SELL
-        UNKNOWN
-
-    Chỉ ánh xạ giá trị được cấu hình rõ ràng hoặc các nhãn chữ
-    thông dụng. Không tự suy luận bên giao dịch từ giá tăng/giảm.
-
-    LƯU Ý:
-    Nếu DNSE sử dụng mã số hoặc enum riêng, cần cấu hình đúng
-    DNSE_SIDE_BUY_VALUE và DNSE_SIDE_SELL_VALUE trong .env.
-    """
     if value is None:
-        return FOOTPRINT_UNKNOWN_SIDE_LABEL
+        return unknown
 
     raw = str(value).strip()
 
     if not raw:
-        return FOOTPRINT_UNKNOWN_SIDE_LABEL
+        return unknown
 
     comparison = raw.upper() if DNSE_SIDE_CASE_INSENSITIVE else raw
 
@@ -193,8 +193,6 @@ def _normalize_side(value: Any) -> str:
         if comparison == target:
             return "SELL"
 
-    # Những nhãn này chỉ được nhận diện khi payload thực sự cung cấp
-    # nhãn văn bản tương ứng.
     buy_labels = {
         "BUY",
         "B",
@@ -221,54 +219,59 @@ def _normalize_side(value: Any) -> str:
     if comparison in sell_labels:
         return "SELL"
 
-    return FOOTPRINT_UNKNOWN_SIDE_LABEL
+    return unknown
 
 
-def _parse_timestamp(value: Any) -> float:
+def _parse_timestamp(value: Any) -> Optional[float]:
     """
     Chuẩn hóa timestamp thành Unix epoch tính bằng giây.
 
-    Hỗ trợ:
-        - Unix timestamp dạng giây.
-        - Unix timestamp dạng mili giây.
-        - ISO 8601 string.
-        - datetime.
-
-    Nếu không đọc được timestamp, sử dụng thời gian hiện tại.
+    Trả về None nếu timestamp không hợp lệ.
+    Không tự thay timestamp lỗi bằng thời gian hiện tại vì điều đó
+    có thể đưa giao dịch lịch sử vào sai cây nến.
     """
     if value is None or value == "":
-        return time.time()
+        return None
 
     if isinstance(value, datetime):
         dt = value
 
         if dt.tzinfo is None:
+            # Giữ hành vi tương thích: datetime không timezone được
+            # xem là UTC. Adapter phải xử lý nếu DNSE gửi giờ local.
             dt = dt.replace(tzinfo=timezone.utc)
 
-        return dt.timestamp()
+        try:
+            timestamp = dt.timestamp()
+        except (ValueError, OverflowError, OSError):
+            return None
+
+        return timestamp if timestamp > 0 else None
 
     if isinstance(value, (int, float, Decimal)):
-        number = float(value)
+        number = _to_float(value)
 
-        if not math.isfinite(number) or number <= 0:
-            return time.time()
+        if number is None or number <= 0:
+            return None
 
-        # Timestamp 13 chữ số thường là mili giây.
-        if number >= 100_000_000_000:
-            number /= 1000.0
-
-        # Timestamp micro giây có thể lớn hơn nhiều.
-        elif number >= 100_000_000_000_000:
+        # Microseconds trước, milliseconds sau.
+        if number >= 100_000_000_000_000:
             number /= 1_000_000.0
+        elif number >= 100_000_000_000:
+            number /= 1_000.0
+
+        # Loại bỏ giá trị quá xa hiện tại do dữ liệu sai đơn vị.
+        if number < 1:
+            return None
 
         return number
 
     raw = str(value).strip()
 
     if not raw:
-        return time.time()
+        return None
 
-    # Thử đọc chuỗi số trước.
+    # Thử chuỗi số.
     try:
         number = float(raw)
 
@@ -276,16 +279,14 @@ def _parse_timestamp(value: Any) -> float:
             if number >= 100_000_000_000_000:
                 number /= 1_000_000.0
             elif number >= 100_000_000_000:
-                number /= 1000.0
+                number /= 1_000.0
 
-            return number
+            return number if number >= 1 else None
 
-    except ValueError:
+    except (ValueError, OverflowError):
         pass
 
-    # Hỗ trợ ISO 8601, ví dụ:
-    # 2026-10-23T09:15:00+07:00
-    # 2026-10-23T02:15:00Z
+    # ISO 8601.
     try:
         normalized = raw
 
@@ -295,39 +296,31 @@ def _parse_timestamp(value: Any) -> float:
         dt = datetime.fromisoformat(normalized)
 
         if dt.tzinfo is None:
-            # Timestamp không có timezone được xem là UTC.
-            # Nếu DNSE trả giờ Việt Nam không kèm timezone, cần
-            # chuẩn hóa timezone tại lớp adapter DNSE.
             dt = dt.replace(tzinfo=timezone.utc)
 
-        return dt.timestamp()
+        timestamp = dt.timestamp()
 
-    except (ValueError, OverflowError):
-        logger.debug(
-            "Không phân tích được timestamp %r; dùng thời gian hiện tại",
-            value,
-        )
+        return timestamp if timestamp > 0 else None
 
-        return time.time()
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
-def _timestamp_to_iso(timestamp: float) -> str:
-    """Chuyển Unix timestamp thành ISO 8601 UTC."""
-    return datetime.fromtimestamp(
-        timestamp,
-        tz=timezone.utc,
-    ).isoformat()
+def _timestamp_to_iso(timestamp: Optional[float]) -> Optional[str]:
+    if timestamp is None:
+        return None
+
+    try:
+        return datetime.fromtimestamp(
+            float(timestamp),
+            tz=timezone.utc,
+        ).isoformat()
+    except (ValueError, OverflowError, OSError, TypeError):
+        return None
 
 
 def _price_key(price: float) -> str:
-    """
-    Chuẩn hóa giá thành khóa chuỗi để gom volume theo mức giá.
-
-    Mặc định giữ 2 chữ số thập phân. Đây là cách gom giá phục vụ
-    hiển thị; không thay thế quy tắc bước giá của từng sàn.
-    """
-    decimals = max(0, int(FOOTPRINT_PRICE_DECIMALS))
-
+    decimals = max(0, min(8, int(FOOTPRINT_PRICE_DECIMALS)))
     quantizer = Decimal("1").scaleb(-decimals)
 
     value = Decimal(str(price)).quantize(
@@ -339,43 +332,42 @@ def _price_key(price: float) -> str:
 
 
 def _safe_trade_id(value: Any) -> Optional[str]:
-    """Chuẩn hóa trade ID."""
     if value is None:
         return None
 
     result = str(value).strip()
 
-    if not result:
-        return None
+    return result or None
 
-    return result
+
+def _timestamp_ms(timestamp_seconds: float) -> int:
+    return int(round(timestamp_seconds * 1000))
+
+
+def _copy_dict(value: dict[str, Any]) -> dict[str, Any]:
+    # Tránh trả tham chiếu tới dict nội bộ của engine.
+    return dict(value)
 
 
 # ============================================================
-# 3. FOOTPRINT ENGINE
+# 3. ENGINE
 # ============================================================
 
 class FootprintEngine:
     """
-    Bộ máy tổng hợp Footprint cho nhiều mã cổ phiếu.
+    Engine tổng hợp giao dịch thành Footprint.
 
-    API chính:
+    persistence:
+        Đối tượng LocalStore tương thích hoặc None.
 
-        engine.add_trade({
-            "symbol": "DXG",
-            "price": 15.25,
-            "quantity": 1000,
-            "side": "BUY",
-            "timestamp": 1792718100,
-            "trade_id": "abc123",
-        })
+    engine_persists_trades:
+        True:
+            Engine ghi giao dịch mới vào LocalStore trước khi cập nhật RAM.
+        False:
+            Tầng upstream chịu trách nhiệm lưu SQLite.
 
-        engine.get_footprint("DXG")
-        engine.get_trades("DXG")
-        engine.get_candles("DXG")
-        engine.get_status()
-
-    Tất cả dữ liệu đều được giữ trong RAM.
+    recover_on_start:
+        Tự phục hồi giao dịch gần nhất từ SQLite khi khởi tạo.
     """
 
     def __init__(
@@ -385,6 +377,10 @@ class FootprintEngine:
         max_candles: int = FOOTPRINT_MAX_CANDLES,
         max_price_levels: int = FOOTPRINT_MAX_PRICE_LEVELS,
         keep_trade_tape: bool = FOOTPRINT_KEEP_TRADE_TAPE,
+        persistence: Any = None,
+        engine_persists_trades: bool = True,
+        recover_on_start: bool = True,
+        recovery_batch_size: int = 10000,
     ) -> None:
         self.max_trades = max(100, int(max_trades))
         self.candle_seconds = max(1, int(candle_seconds))
@@ -392,28 +388,29 @@ class FootprintEngine:
         self.max_price_levels = max(10, int(max_price_levels))
         self.keep_trade_tape = bool(keep_trade_tape)
 
-        # Khóa chung bảo vệ trạng thái engine.
+        self.persistence = persistence
+        self.engine_persists_trades = bool(engine_persists_trades)
+        self.recovery_batch_size = max(100, int(recovery_batch_size))
+
         self._lock = threading.RLock()
 
-        # symbol -> price_key -> thống kê tại mức giá.
+        # symbol -> price_key -> aggregate.
         self._price_levels: dict[str, dict[str, dict[str, Any]]] = {}
 
-        # symbol -> danh sách giao dịch gần nhất.
+        # symbol -> recent trades.
         self._trades: dict[str, list[dict[str, Any]]] = {}
 
-        # symbol -> timestamp bucket -> candle.
-        self._candles: dict[str, OrderedDict[int, dict[str, Any]]] = {}
+        # symbol -> bucket -> candle.
+        self._candles: dict[
+            str,
+            OrderedDict[int, dict[str, Any]],
+        ] = {}
 
-        # symbol -> trade IDs đã thấy.
+        # symbol -> recently seen IDs.
         self._seen_trade_ids: dict[str, OrderedDict[str, None]] = {}
 
-        # symbol -> tổng hợp thống kê.
         self._stats: dict[str, dict[str, Any]] = {}
-
-        # symbol -> cumulative delta hiện tại.
-        self._cumulative_delta: dict[str, float] = {}
-
-        # symbol -> trạng thái delta có đầy đủ phân loại hay không.
+        self._cumulative_delta: dict[str, Optional[float]] = {}
         self._delta_complete: dict[str, bool] = {}
 
         self._started_at = time.time()
@@ -423,32 +420,37 @@ class FootprintEngine:
         self._accepted_count = 0
         self._duplicate_count = 0
         self._rejected_count = 0
+        self._persistence_error_count = 0
+        self._recovered_count = 0
+
+        self._persistence_enabled = persistence is not None
+        self._recovery_completed = False
+        self._last_persistence_error: Optional[str] = None
 
         self._initialize_symbol_locked("DXG")
 
+        if recover_on_start and self.persistence is not None:
+            try:
+                self.recover_from_store()
+            except Exception:
+                logger.exception("Không thể phục hồi Footprint từ LocalStore.")
+
         logger.info(
             "FootprintEngine initialized: max_trades=%s, "
-            "candle_seconds=%s, max_candles=%s",
+            "candle_seconds=%s, max_candles=%s, persistence=%s",
             self.max_trades,
             self.candle_seconds,
             self.max_candles,
+            self._persistence_enabled,
         )
 
     # ========================================================
-    # 4. KHỞI TẠO TRẠNG THÁI MÃ
+    # 4. STATE INITIALIZATION
     # ========================================================
 
-    def _initialize_symbol_locked(self, symbol: str) -> None:
-        """Khởi tạo bộ nhớ cho một mã; phải gọi khi đang giữ lock."""
-        if symbol in self._stats:
-            return
-
-        self._price_levels[symbol] = {}
-        self._trades[symbol] = []
-        self._candles[symbol] = OrderedDict()
-        self._seen_trade_ids[symbol] = OrderedDict()
-
-        self._stats[symbol] = {
+    @staticmethod
+    def _empty_stats() -> dict[str, Any]:
+        return {
             "trade_count": 0,
             "total_volume": 0.0,
             "buy_volume": 0.0,
@@ -461,11 +463,20 @@ class FootprintEngine:
             "first_trade_at": None,
         }
 
+    def _initialize_symbol_locked(self, symbol: str) -> None:
+        if symbol in self._stats:
+            return
+
+        self._price_levels[symbol] = {}
+        self._trades[symbol] = []
+        self._candles[symbol] = OrderedDict()
+        self._seen_trade_ids[symbol] = OrderedDict()
+        self._stats[symbol] = self._empty_stats()
+
         self._cumulative_delta[symbol] = 0.0
         self._delta_complete[symbol] = True
 
     def register_symbol(self, symbol: str) -> bool:
-        """Đăng ký mã cần theo dõi."""
         normalized = _normalize_symbol(symbol)
 
         if not normalized:
@@ -477,7 +488,6 @@ class FootprintEngine:
         return True
 
     def register_symbols(self, symbols: list[str]) -> list[str]:
-        """Đăng ký nhiều mã; trả về danh sách mã hợp lệ."""
         registered: list[str] = []
 
         for symbol in symbols:
@@ -490,103 +500,95 @@ class FootprintEngine:
         return registered
 
     # ========================================================
-    # 5. CHUẨN HÓA GIAO DỊCH
+    # 5. TRADE NORMALIZATION
     # ========================================================
 
     def _normalize_trade(
         self,
         trade: dict[str, Any],
     ) -> Optional[dict[str, Any]]:
-        """
-        Chuẩn hóa một giao dịch.
-
-        Tên trường đầu vào được hỗ trợ:
-            symbol / ticker / code
-            price / matchPrice / matchedPrice
-            quantity / volume / qty / matchedQuantity
-            side / aggressorSide / tradeSide
-            timestamp / time / tradeTime / matchedAt
-            trade_id / tradeId / matchId / id
-        """
         if not isinstance(trade, dict):
             return None
 
         symbol = _normalize_symbol(
-            trade.get("symbol")
-            or trade.get("ticker")
-            or trade.get("code")
-            or trade.get("stockSymbol")
+            _first_value(
+                trade,
+                "symbol",
+                "ticker",
+                "code",
+                "stockSymbol",
+            )
         )
 
         price = _to_positive_float(
-            trade.get("price")
-            if trade.get("price") is not None
-            else trade.get("matchPrice")
-            if trade.get("matchPrice") is not None
-            else trade.get("matchedPrice")
-            if trade.get("matchedPrice") is not None
-            else trade.get("lastPrice")
+            _first_value(
+                trade,
+                "price",
+                "matchPrice",
+                "matchedPrice",
+                "lastPrice",
+            )
         )
 
         volume = _to_positive_float(
-            trade.get("quantity")
-            if trade.get("quantity") is not None
-            else trade.get("volume")
-            if trade.get("volume") is not None
-            else trade.get("qty")
-            if trade.get("qty") is not None
-            else trade.get("matchedQuantity")
-            if trade.get("matchedQuantity") is not None
-            else trade.get("matchedQty")
+            _first_value(
+                trade,
+                "quantity",
+                "volume",
+                "qty",
+                "matchedQuantity",
+                "matchedQty",
+            )
         )
 
-        raw_side = (
-            trade.get("side")
-            if trade.get("side") is not None
-            else trade.get("aggressorSide")
-            if trade.get("aggressorSide") is not None
-            else trade.get("tradeSide")
-            if trade.get("tradeSide") is not None
-            else trade.get("matchSide")
+        raw_side = _first_value(
+            trade,
+            "side",
+            "aggressorSide",
+            "tradeSide",
+            "matchSide",
         )
 
-        raw_timestamp = (
-            trade.get("timestamp")
-            if trade.get("timestamp") is not None
-            else trade.get("time")
-            if trade.get("time") is not None
-            else trade.get("tradeTime")
-            if trade.get("tradeTime") is not None
-            else trade.get("matchedAt")
-            if trade.get("matchedAt") is not None
-            else trade.get("transactTime")
+        raw_timestamp = _first_value(
+            trade,
+            "timestamp",
+            "time",
+            "tradeTime",
+            "matchedAt",
+            "transactTime",
         )
 
         trade_id = _safe_trade_id(
-            trade.get("trade_id")
-            or trade.get("tradeId")
-            or trade.get("matchId")
-            or trade.get("executionId")
-            or trade.get("id")
+            _first_value(
+                trade,
+                "trade_id",
+                "tradeId",
+                "matchId",
+                "executionId",
+                "id",
+            )
         )
 
-        if not symbol:
-            return None
-
-        if price is None or volume is None:
+        if not symbol or price is None or volume is None:
             return None
 
         timestamp = _parse_timestamp(raw_timestamp)
 
+        if timestamp is None:
+            return None
+
         side = _normalize_side(raw_side)
 
+        # Chuẩn hóa về một cấu trúc chung.
         normalized = {
             "symbol": symbol,
             "price": price,
             "price_key": _price_key(price),
             "volume": volume,
+            "quantity": volume,
             "side": side,
             "timestamp": timestamp,
+            "timestamp_ms": _timestamp_ms(timestamp),
             "datetime": _timestamp_to_iso(timestamp),
             "trade_id": trade_id,
             "notional": price * volume,
@@ -595,16 +597,77 @@ class FootprintEngine:
         return normalized
 
     # ========================================================
-    # 6. NHẬN GIAO DỊCH
+    # 6. PERSISTENCE ADAPTER
+    # ========================================================
+
+    def _persist_trade(self, trade: dict[str, Any]) -> bool:
+        """
+        Ghi giao dịch qua LocalStore.
+
+        Trả về False nếu lưu thất bại. Khi engine_persists_trades=True,
+        giao dịch không được đưa vào RAM nếu lưu SQLite thất bại.
+        """
+        if self.persistence is None or not self.engine_persists_trades:
+            return True
+
+        try:
+            result = self.persistence.save_trade({
+                "symbol": trade["symbol"],
+                "trade_id": trade["trade_id"],
+                "timestamp": trade["timestamp_ms"],
+                "price": trade["price"],
+                "volume": trade["volume"],
+                "side": trade["side"],
+                "raw": {
+                    "symbol": trade["symbol"],
+                    "price": trade["price"],
+                    "quantity": trade["volume"],
+                    "side": trade["side"],
+                    "timestamp": trade["timestamp"],
+                    "trade_id": trade["trade_id"],
+                },
+            })
+
+            # Hỗ trợ LocalStore trả bool hoặc dict.
+            if result is False:
+                raise RuntimeError("LocalStore.save_trade() trả về False")
+
+            if isinstance(result, dict):
+                if result.get("success") is False:
+                    raise RuntimeError(
+                        str(result.get("error") or "SQLite save failed")
+                    )
+
+                if result.get("duplicate") is True:
+                    return False
+
+            self._last_persistence_error = None
+            return True
+
+        except Exception as exc:
+            self._persistence_error_count += 1
+            self._last_persistence_error = str(exc)
+
+            logger.exception(
+                "Không thể lưu giao dịch %s/%s vào SQLite",
+                trade.get("symbol"),
+                trade.get("trade_id"),
+            )
+
+            return False
+
+    # ========================================================
+    # 7. ADD TRADE
     # ========================================================
 
     def add_trade(self, trade: dict[str, Any]) -> bool:
         """
-        Thêm một giao dịch vào engine.
+        Nhận một giao dịch.
 
-        Returns:
-            True: giao dịch được chấp nhận.
-            False: dữ liệu không hợp lệ hoặc giao dịch trùng.
+        True:
+            Giao dịch mới được chấp nhận vào engine.
+        False:
+            Dữ liệu không hợp lệ, trùng ID hoặc không ghi được SQLite.
         """
         with self._lock:
             self._received_count += 1
@@ -615,7 +678,7 @@ class FootprintEngine:
             with self._lock:
                 self._rejected_count += 1
 
-            logger.debug("Bỏ qua giao dịch không hợp lệ.")
+            logger.debug("Bỏ qua giao dịch không hợp lệ: %r", trade)
             return False
 
         symbol = normalized["symbol"]
@@ -624,39 +687,70 @@ class FootprintEngine:
         with self._lock:
             self._initialize_symbol_locked(symbol)
 
-            # Chống trùng theo trade ID khi nguồn cung cấp ID.
             if trade_id:
-                seen = self._seen_trade_ids[symbol]
-
-                if trade_id in seen:
+                if trade_id in self._seen_trade_ids[symbol]:
                     self._duplicate_count += 1
                     return False
 
+        # Không giữ engine lock trong lúc thao tác SQLite.
+        # Việc này hạn chế chặn các request đọc dữ liệu.
+        persisted = self._persist_trade(normalized)
+
+        if not persisted:
+            with self._lock:
+                # Nếu LocalStore báo duplicate, không tăng rejected.
+                # Nhưng không được thêm giao dịch vào RAM lần nữa.
+                self._duplicate_count += 1
+
+            return False
+
+        with self._lock:
+            self._initialize_symbol_locked(symbol)
+
+            # Kiểm tra lại sau khi rời lock để ghi SQLite.
+            # Tránh hai thread cùng đưa một ID vào RAM.
+            if trade_id and trade_id in self._seen_trade_ids[symbol]:
+                self._duplicate_count += 1
+                return False
+
+            if trade_id:
+                seen = self._seen_trade_ids[symbol]
                 seen[trade_id] = None
 
-                # Giới hạn bộ nhớ chống trùng.
                 while len(seen) > self.max_trades * 2:
                     seen.popitem(last=False)
 
             self._update_price_level_locked(normalized)
-            self._update_candle_locked(normalized)
             self._update_stats_locked(normalized)
 
             if self.keep_trade_tape:
                 self._trades[symbol].append(normalized)
 
-                if len(self._trades[symbol]) > self.max_trades:
-                    excess = len(self._trades[symbol]) - self.max_trades
+                self._trades[symbol].sort(
+                    key=lambda item: (
+                        item["timestamp"],
+                        item.get("trade_id") or "",
+                    )
+                )
 
-                    del self._trades[symbol][:excess]
+                if len(self._trades[symbol]) > self.max_trades:
+                    self._trades[symbol] = self._trades[symbol][
+                        -self.max_trades:
+                    ]
+
+            self._update_candle_locked(normalized)
 
             self._accepted_count += 1
-            self._last_trade_at = normalized["timestamp"]
+
+            if (
+                self._last_trade_at is None
+                or normalized["timestamp"] > self._last_trade_at
+            ):
+                self._last_trade_at = normalized["timestamp"]
 
         return True
 
     def add_trades(self, trades: list[dict[str, Any]]) -> dict[str, int]:
-        """Thêm nhiều giao dịch và trả về thống kê xử lý."""
         accepted = 0
         rejected = 0
 
@@ -673,14 +767,13 @@ class FootprintEngine:
         }
 
     # ========================================================
-    # 7. TỔNG HỢP VOLUME THEO MỨC GIÁ
+    # 8. PRICE LEVEL AGGREGATION
     # ========================================================
 
     def _update_price_level_locked(
         self,
         trade: dict[str, Any],
     ) -> None:
-        """Cập nhật thống kê mức giá; phải gọi khi đang giữ lock."""
         symbol = trade["symbol"]
         price_key = trade["price_key"]
         price = trade["price"]
@@ -711,55 +804,38 @@ class FootprintEngine:
 
         if side == "BUY":
             level["buy_volume"] += volume
-
         elif side == "SELL":
             level["sell_volume"] += volume
-
         else:
             level["unknown_volume"] += volume
 
-        # Delta chỉ hợp lệ khi toàn bộ volume tại mức giá
-        # được phân loại thành BUY hoặc SELL.
+        directional = level["buy_volume"] + level["sell_volume"]
+
         if level["unknown_volume"] <= 0:
             level["delta"] = (
                 level["buy_volume"] - level["sell_volume"]
             )
-
-            total_directional = (
-                level["buy_volume"] + level["sell_volume"]
+            level["delta_percent"] = (
+                level["delta"] / directional * 100.0
+                if directional > 0
+                else None
             )
-
-            if total_directional > 0:
-                level["delta_percent"] = (
-                    level["delta"] / total_directional
-                ) * 100.0
-
-            else:
-                level["delta_percent"] = None
-
         else:
             level["delta"] = None
             level["delta_percent"] = None
 
-        # Giới hạn số mức giá để tránh tăng RAM vô hạn.
-        # Nếu vượt giới hạn, bỏ mức giá có tổng volume thấp nhất.
-        if len(levels) > self.max_price_levels:
-            lowest_key = min(
-                levels,
-                key=lambda key: levels[key]["total_volume"],
-            )
-
-            levels.pop(lowest_key, None)
+        # Không xóa mức giá khỏi thống kê tổng hợp.
+        # Nếu có nhiều mức giá, giữ toàn bộ aggregate trong RAM để POC
+        # và tổng volume không bị sai. API có thể giới hạn kết quả trả về.
 
     # ========================================================
-    # 8. TỔNG HỢP NẾN OHLCV
+    # 9. CANDLE AGGREGATION
     # ========================================================
 
     def _update_candle_locked(
         self,
         trade: dict[str, Any],
     ) -> None:
-        """Cập nhật nến theo khoảng thời gian đã cấu hình."""
         symbol = trade["symbol"]
         timestamp = trade["timestamp"]
         price = trade["price"]
@@ -777,6 +853,7 @@ class FootprintEngine:
             candles[bucket] = {
                 "symbol": symbol,
                 "timestamp": bucket,
+                "timestamp_ms": bucket * 1000,
                 "datetime": _timestamp_to_iso(bucket),
                 "open": price,
                 "high": price,
@@ -790,13 +867,47 @@ class FootprintEngine:
                 "notional": 0.0,
                 "delta": None,
                 "cumulative_delta": None,
+                "_first_trade_timestamp": timestamp,
+                "_last_trade_timestamp": timestamp,
+                "_first_trade_id": trade.get("trade_id") or "",
+                "_last_trade_id": trade.get("trade_id") or "",
             }
 
         candle = candles[bucket]
 
         candle["high"] = max(candle["high"], price)
         candle["low"] = min(candle["low"], price)
-        candle["close"] = price
+
+        # OHLC phải dựa theo timestamp, không dựa theo thứ tự nhận.
+        first_key = (
+            timestamp,
+            trade.get("trade_id") or "",
+        )
+
+        open_key = (
+            candle["_first_trade_timestamp"],
+            candle["_first_trade_id"],
+        )
+
+        if first_key < open_key:
+            candle["_first_trade_timestamp"] = timestamp
+            candle["_first_trade_id"] = trade.get("trade_id") or ""
+            candle["open"] = price
+
+        last_key = (
+            timestamp,
+            trade.get("trade_id") or "",
+        )
+
+        close_key = (
+            candle["_last_trade_timestamp"],
+            candle["_last_trade_id"],
+        )
+
+        if last_key >= close_key:
+            candle["_last_trade_timestamp"] = timestamp
+            candle["_last_trade_id"] = trade.get("trade_id") or ""
+            candle["close"] = price
 
         candle["volume"] += volume
         candle["trade_count"] += 1
@@ -804,10 +915,8 @@ class FootprintEngine:
 
         if side == "BUY":
             candle["buy_volume"] += volume
-
         elif side == "SELL":
             candle["sell_volume"] += volume
-
         else:
             candle["unknown_volume"] += volume
 
@@ -815,12 +924,13 @@ class FootprintEngine:
             candle["delta"] = (
                 candle["buy_volume"] - candle["sell_volume"]
             )
-
         else:
             candle["delta"] = None
 
-        # Sắp xếp theo bucket và giới hạn số nến.
-        candles.move_to_end(bucket)
+        # Giữ bucket theo thứ tự thời gian, kể cả khi nhận giao dịch muộn.
+        candles[bucket] = candle
+        candles = OrderedDict(sorted(candles.items()))
+        self._candles[symbol] = candles
 
         while len(candles) > self.max_candles:
             candles.popitem(last=False)
@@ -832,35 +942,43 @@ class FootprintEngine:
         symbol: str,
     ) -> None:
         """
-        Tính Cumulative Delta theo thứ tự thời gian.
+        Cumulative Delta được tính trên tập nến hiện còn trong RAM.
 
-        Nếu có bất kỳ nến nào chứa unknown volume, không thể xác nhận
-        Cumulative Delta hoàn chỉnh cho toàn bộ chuỗi nến.
+        Nếu nến có UNKNOWN volume, cumulative delta của nến đó và
+        các nến sau nó không được xác nhận.
         """
         running_delta = 0.0
-        all_complete = True
+        complete_so_far = True
 
         for candle in self._candles[symbol].values():
-            if candle["delta"] is None:
+            delta = candle["delta"]
+
+            if delta is None:
                 candle["cumulative_delta"] = None
-                all_complete = False
+                complete_so_far = False
                 continue
 
-            running_delta += candle["delta"]
-            candle["cumulative_delta"] = running_delta
+            if complete_so_far:
+                running_delta += delta
+                candle["cumulative_delta"] = running_delta
+            else:
+                candle["cumulative_delta"] = None
 
-        self._cumulative_delta[symbol] = running_delta
-        self._delta_complete[symbol] = all_complete
+        if complete_so_far:
+            self._cumulative_delta[symbol] = running_delta
+            self._delta_complete[symbol] = True
+        else:
+            self._cumulative_delta[symbol] = None
+            self._delta_complete[symbol] = False
 
     # ========================================================
-    # 9. CẬP NHẬT THỐNG KÊ TỔNG
+    # 10. SYMBOL STATS
     # ========================================================
 
     def _update_stats_locked(
         self,
         trade: dict[str, Any],
     ) -> None:
-        """Cập nhật tổng thống kê theo mã."""
         symbol = trade["symbol"]
         stats = self._stats[symbol]
 
@@ -875,22 +993,28 @@ class FootprintEngine:
 
         if side == "BUY":
             stats["buy_volume"] += volume
-
         elif side == "SELL":
             stats["sell_volume"] += volume
-
         else:
             stats["unknown_volume"] += volume
 
-        stats["last_price"] = price
-        stats["last_volume"] = volume
-        stats["last_trade_at"] = timestamp
+        # Last trade dựa trên timestamp lớn nhất.
+        if (
+            stats["last_trade_at"] is None
+            or timestamp >= stats["last_trade_at"]
+        ):
+            stats["last_price"] = price
+            stats["last_volume"] = volume
+            stats["last_trade_at"] = timestamp
 
-        if stats["first_trade_at"] is None:
+        if (
+            stats["first_trade_at"] is None
+            or timestamp < stats["first_trade_at"]
+        ):
             stats["first_trade_at"] = timestamp
 
     # ========================================================
-    # 10. LẤY FOOTPRINT THEO MỨC GIÁ
+    # 11. FOOTPRINT API
     # ========================================================
 
     def get_footprint(
@@ -900,17 +1024,6 @@ class FootprintEngine:
         sort: str = "price",
         descending: bool = False,
     ) -> dict[str, Any]:
-        """
-        Lấy Footprint tổng hợp của một mã.
-
-        sort:
-            price  : sắp xếp theo mức giá.
-            volume : sắp xếp theo tổng volume.
-            delta  : sắp xếp theo Delta đã xác định.
-
-        descending:
-            True để sắp xếp giảm dần.
-        """
         normalized_symbol = _normalize_symbol(symbol)
 
         if not normalized_symbol:
@@ -923,75 +1036,66 @@ class FootprintEngine:
         with self._lock:
             self._initialize_symbol_locked(normalized_symbol)
 
-            stats = dict(self._stats[normalized_symbol])
+            stats = _copy_dict(self._stats[normalized_symbol])
 
             levels = [
-                dict(level)
+                _copy_dict(level)
                 for level in self._price_levels[
                     normalized_symbol
                 ].values()
             ]
 
-            cumulative_delta = self._cumulative_delta[
+            cumulative_delta = self._cumulative_delta[normalized_symbol]
+            cumulative_delta_complete = self._delta_complete[
                 normalized_symbol
             ]
 
-            delta_complete = self._delta_complete[
-                normalized_symbol
-            ]
-
-            candle_count = len(
-                self._candles[normalized_symbol]
-            )
+            candle_count = len(self._candles[normalized_symbol])
 
         if sort == "volume":
             levels.sort(
                 key=lambda item: item["total_volume"],
                 reverse=descending,
             )
-
         elif sort == "delta":
-            # Các mức giá chưa xác định Delta sẽ được đưa xuống cuối.
-            levels.sort(
-                key=lambda item: (
-                    item["delta"] is None,
-                    item["delta"] or 0.0,
-                ),
+            # UNKNOWN delta luôn được xếp cuối, bất kể chiều sắp xếp.
+            known = [item for item in levels if item["delta"] is not None]
+            unknown = [item for item in levels if item["delta"] is None]
+
+            known.sort(
+                key=lambda item: item["delta"],
                 reverse=descending,
             )
 
+            levels = known + unknown
         else:
             levels.sort(
                 key=lambda item: item["price"],
                 reverse=descending,
             )
 
-        poc = None
-
-        if levels:
-            # POC = mức giá có total_volume cao nhất.
-            poc = max(
+        poc = (
+            max(
                 levels,
                 key=lambda item: item["total_volume"],
             )
-
-        directional_volume = (
-            stats["buy_volume"] + stats["sell_volume"]
+            if levels
+            else None
         )
 
+        directional_volume = stats["buy_volume"] + stats["sell_volume"]
+
+        total_delta: Optional[float]
+
         if stats["unknown_volume"] <= 0:
-            total_delta: Optional[float] = (
-                stats["buy_volume"] - stats["sell_volume"]
-            )
+            total_delta = stats["buy_volume"] - stats["sell_volume"]
         else:
             total_delta = None
 
         delta_percent = None
 
         if total_delta is not None and directional_volume > 0:
-            delta_percent = (
-                total_delta / directional_volume
-            ) * 100.0
+            delta_percent = total_delta / directional_volume * 100.0
 
         return {
             "success": True,
@@ -1006,36 +1110,30 @@ class FootprintEngine:
                 "notional": stats["notional"],
                 "last_price": stats["last_price"],
                 "last_volume": stats["last_volume"],
-                "first_trade_at": (
-                    _timestamp_to_iso(stats["first_trade_at"])
-                    if stats["first_trade_at"] is not None
-                    else None
+                "first_trade_at": _timestamp_to_iso(
+                    stats["first_trade_at"]
                 ),
-                "last_trade_at": (
-                    _timestamp_to_iso(stats["last_trade_at"])
-                    if stats["last_trade_at"] is not None
-                    else None
+                "last_trade_at": _timestamp_to_iso(
+                    stats["last_trade_at"]
                 ),
                 "delta": total_delta,
                 "delta_percent": delta_percent,
                 "cumulative_delta": (
                     cumulative_delta
-                    if delta_complete
+                    if cumulative_delta_complete
                     else None
                 ),
-                "delta_complete": (
-                    stats["unknown_volume"] <= 0
-                ),
-                "cumulative_delta_complete": delta_complete,
+                "delta_complete": stats["unknown_volume"] <= 0,
+                "cumulative_delta_complete": cumulative_delta_complete,
                 "price_level_count": len(levels),
                 "candle_count": candle_count,
             },
-            "poc": dict(poc) if poc else None,
+            "poc": _copy_dict(poc) if poc else None,
             "price_levels": levels,
         }
 
     # ========================================================
-    # 11. LẤY TRADE TAPE
+    # 12. TRADE TAPE
     # ========================================================
 
     def get_trades(
@@ -1045,7 +1143,6 @@ class FootprintEngine:
         limit: int = 100,
         newest_first: bool = True,
     ) -> dict[str, Any]:
-        """Lấy danh sách giao dịch gần nhất của một mã."""
         normalized_symbol = _normalize_symbol(symbol)
 
         if not normalized_symbol:
@@ -1070,9 +1167,7 @@ class FootprintEngine:
                     "trade_tape_enabled": False,
                 }
 
-            trades = list(
-                self._trades[normalized_symbol]
-            )
+            trades = list(self._trades[normalized_symbol])
 
         if newest_first:
             trades.reverse()
@@ -1088,7 +1183,7 @@ class FootprintEngine:
         }
 
     # ========================================================
-    # 12. LẤY NẾN
+    # 13. CANDLES
     # ========================================================
 
     def get_candles(
@@ -1098,7 +1193,6 @@ class FootprintEngine:
         limit: int = 100,
         newest_first: bool = False,
     ) -> dict[str, Any]:
-        """Lấy các nến đã tổng hợp từ dữ liệu giao dịch nhận được."""
         normalized_symbol = _normalize_symbol(symbol)
 
         if not normalized_symbol:
@@ -1115,10 +1209,12 @@ class FootprintEngine:
             self._initialize_symbol_locked(normalized_symbol)
 
             candles = [
-                dict(candle)
-                for candle in self._candles[
-                    normalized_symbol
-                ].values()
+                {
+                    key: value
+                    for key, value in candle.items()
+                    if not key.startswith("_")
+                }
+                for candle in self._candles[normalized_symbol].values()
             ]
 
         if newest_first:
@@ -1135,20 +1231,18 @@ class FootprintEngine:
         }
 
     # ========================================================
-    # 13. LẤY DANH SÁCH MÃ
+    # 14. SYMBOLS
     # ========================================================
 
     def get_symbols(self) -> list[str]:
-        """Trả về danh sách mã đã được đăng ký hoặc nhận dữ liệu."""
         with self._lock:
             return sorted(self._stats.keys())
 
     # ========================================================
-    # 14. TRẠNG THÁI ENGINE
+    # 15. STATUS
     # ========================================================
 
     def get_status(self) -> dict[str, Any]:
-        """Trả về tình trạng engine và thống kê nhận dữ liệu."""
         with self._lock:
             symbols: dict[str, Any] = {}
 
@@ -1156,55 +1250,261 @@ class FootprintEngine:
                 symbols[symbol] = {
                     "trade_count": stats["trade_count"],
                     "total_volume": stats["total_volume"],
+                    "buy_volume": stats["buy_volume"],
+                    "sell_volume": stats["sell_volume"],
+                    "unknown_volume": stats["unknown_volume"],
                     "last_price": stats["last_price"],
-                    "last_trade_at": (
-                        _timestamp_to_iso(stats["last_trade_at"])
-                        if stats["last_trade_at"] is not None
-                        else None
+                    "last_trade_at": _timestamp_to_iso(
+                        stats["last_trade_at"]
                     ),
                     "price_level_count": len(
                         self._price_levels[symbol]
                     ),
-                    "candle_count": len(
-                        self._candles[symbol]
-                    ),
+                    "candle_count": len(self._candles[symbol]),
                 }
 
             return {
                 "success": True,
                 "engine": "DNSE Footprint Engine",
-                "storage": "RAM",
-                "started_at": _timestamp_to_iso(
-                    self._started_at
+                "storage": (
+                    "SQLite+RAM"
+                    if self.persistence is not None
+                    else "RAM"
                 ),
+                "persistence_enabled": self.persistence is not None,
+                "engine_persists_trades": self.engine_persists_trades,
+                "recovery_completed": self._recovery_completed,
+                "recovered_count": self._recovered_count,
+                "started_at": _timestamp_to_iso(self._started_at),
                 "uptime_seconds": max(
                     0,
                     int(time.time() - self._started_at),
                 ),
-                "last_trade_at": (
-                    _timestamp_to_iso(self._last_trade_at)
-                    if self._last_trade_at is not None
-                    else None
-                ),
+                "last_trade_at": _timestamp_to_iso(self._last_trade_at),
                 "received_count": self._received_count,
                 "accepted_count": self._accepted_count,
                 "duplicate_count": self._duplicate_count,
                 "rejected_count": self._rejected_count,
+                "persistence_error_count": self._persistence_error_count,
+                "last_persistence_error": self._last_persistence_error,
                 "trade_tape_enabled": self.keep_trade_tape,
                 "candle_seconds": self.candle_seconds,
+                "max_trades": self.max_trades,
+                "max_candles": self.max_candles,
+                "max_price_levels": self.max_price_levels,
                 "symbols": symbols,
             }
 
     # ========================================================
-    # 15. XÓA DỮ LIỆU
+    # 16. RECOVERY FROM SQLITE
+    # ========================================================
+
+    def recover_from_store(
+        self,
+        *,
+        symbols: Optional[list[str]] = None,
+        limit: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """
+        Nạp dữ liệu từ LocalStore vào RAM.
+
+        LocalStore.load_trades() được kỳ vọng trả về:
+            {
+                "symbol": "...",
+                "trade_id": "...",
+                "timestamp": epoch milliseconds,
+                "price": ...,
+                "volume": ...,
+                "side": ...
+            }
+
+        Nếu LocalStore của dự án trả về cấu trúc khác, cần điều chỉnh
+        adapter này cho khớp với local_store.py thực tế.
+        """
+        if self.persistence is None:
+            return {
+                "success": False,
+                "error": "Persistence is not configured",
+                "recovered": 0,
+            }
+
+        load_trades = getattr(self.persistence, "load_trades", None)
+
+        if not callable(load_trades):
+            return {
+                "success": False,
+                "error": "LocalStore không có phương thức load_trades()",
+                "recovered": 0,
+            }
+
+        requested_limit = (
+            max(1, int(limit))
+            if limit is not None
+            else self.recovery_batch_size
+        )
+
+        recovered = 0
+        duplicates = 0
+        rejected = 0
+
+        try:
+            # LocalStore hiện tại có thể chỉ trả một trang giới hạn.
+            # Chỉ gọi một lần nếu chưa có cursor/page API.
+            rows = load_trades(
+                limit=requested_limit,
+                order="ASC",
+            )
+
+            if isinstance(rows, dict):
+                rows = rows.get("trades", rows.get("data", []))
+
+            if not isinstance(rows, list):
+                raise TypeError(
+                    "LocalStore.load_trades() phải trả về list hoặc dict chứa trades"
+                )
+
+            normalized_symbols = None
+
+            if symbols:
+                normalized_symbols = {
+                    item
+                    for item in (
+                        _normalize_symbol(symbol)
+                        for symbol in symbols
+                    )
+                    if item
+                }
+
+            # Nạp từ cũ đến mới để OHLCV được tạo đúng thứ tự.
+            rows = sorted(
+                rows,
+                key=lambda row: (
+                    _parse_timestamp(
+                        _first_value(
+                            row,
+                            "timestamp",
+                            "time",
+                            "tradeTime",
+                        )
+                    )
+                    or 0,
+                    str(
+                        _first_value(
+                            row,
+                            "trade_id",
+                            "tradeId",
+                            "id",
+                        )
+                        or ""
+                    ),
+                ),
+            )
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    rejected += 1
+                    continue
+
+                symbol = _normalize_symbol(
+                    _first_value(row, "symbol", "ticker", "code")
+                )
+
+                if not symbol:
+                    rejected += 1
+                    continue
+
+                if (
+                    normalized_symbols is not None
+                    and symbol not in normalized_symbols
+                ):
+                    continue
+
+                # Không gọi add_trade() vì nó có thể ghi lại SQLite.
+                normalized = self._normalize_trade(row)
+
+                if normalized is None:
+                    rejected += 1
+                    continue
+
+                trade_id = normalized["trade_id"]
+
+                with self._lock:
+                    self._initialize_symbol_locked(symbol)
+
+                    if (
+                        trade_id
+                        and trade_id in self._seen_trade_ids[symbol]
+                    ):
+                        duplicates += 1
+                        continue
+
+                    if trade_id:
+                        self._seen_trade_ids[symbol][trade_id] = None
+
+                    self._update_price_level_locked(normalized)
+                    self._update_stats_locked(normalized)
+
+                    if self.keep_trade_tape:
+                        self._trades[symbol].append(normalized)
+
+                        if len(self._trades[symbol]) > self.max_trades:
+                            self._trades[symbol] = self._trades[symbol][
+                                -self.max_trades:
+                            ]
+
+                    self._update_candle_locked(normalized)
+
+                    if (
+                        self._last_trade_at is None
+                        or normalized["timestamp"] > self._last_trade_at
+                    ):
+                        self._last_trade_at = normalized["timestamp"]
+
+                    self._accepted_count += 1
+
+                recovered += 1
+
+            with self._lock:
+                self._recovered_count += recovered
+                self._recovery_completed = True
+
+            logger.info(
+                "Footprint recovery completed: recovered=%s duplicates=%s rejected=%s",
+                recovered,
+                duplicates,
+                rejected,
+            )
+
+            return {
+                "success": True,
+                "recovered": recovered,
+                "duplicates": duplicates,
+                "rejected": rejected,
+            }
+
+        except Exception as exc:
+            with self._lock:
+                self._last_persistence_error = str(exc)
+
+            logger.exception("Lỗi phục hồi dữ liệu từ SQLite.")
+
+            return {
+                "success": False,
+                "error": str(exc),
+                "recovered": recovered,
+                "duplicates": duplicates,
+                "rejected": rejected,
+            }
+
+    # ========================================================
+    # 17. CLEAR / RESET
     # ========================================================
 
     def clear_symbol(self, symbol: str) -> bool:
         """
         Xóa dữ liệu của một mã khỏi RAM.
 
-        Không thể hoàn tác.
-        Không xóa dữ liệu trong Supabase.
+        Không xóa dữ liệu trong SQLite.
         """
         normalized_symbol = _normalize_symbol(symbol)
 
@@ -1229,9 +1529,10 @@ class FootprintEngine:
 
     def reset(self) -> None:
         """
-        Xóa toàn bộ dữ liệu Footprint trong RAM.
+        Reset dữ liệu tổng hợp trong RAM.
 
-        Chỉ sử dụng khi thật sự muốn bắt đầu lại phiên thu thập.
+        Không xóa dữ liệu SQLite. Nếu bật recovery tự động, dữ liệu có
+        thể được nạp lại khi gọi recover_from_store().
         """
         with self._lock:
             symbols = list(self._stats.keys())
@@ -1241,20 +1542,7 @@ class FootprintEngine:
                 self._trades[symbol] = []
                 self._candles[symbol] = OrderedDict()
                 self._seen_trade_ids[symbol] = OrderedDict()
-
-                self._stats[symbol] = {
-                    "trade_count": 0,
-                    "total_volume": 0.0,
-                    "buy_volume": 0.0,
-                    "sell_volume": 0.0,
-                    "unknown_volume": 0.0,
-                    "notional": 0.0,
-                    "last_price": None,
-                    "last_volume": None,
-                    "last_trade_at": None,
-                    "first_trade_at": None,
-                }
-
+                self._stats[symbol] = self._empty_stats()
                 self._cumulative_delta[symbol] = 0.0
                 self._delta_complete[symbol] = True
 
@@ -1264,24 +1552,48 @@ class FootprintEngine:
             self._rejected_count = 0
             self._last_trade_at = None
             self._started_at = time.time()
+            self._recovered_count = 0
+            self._recovery_completed = False
 
         logger.warning("Đã reset toàn bộ Footprint Engine trong RAM.")
 
 
 # ============================================================
-# 16. TẠO INSTANCE DÙNG CHUNG
+# 18. SHARED INSTANCE
 # ============================================================
 
-# Có thể import instance này từ routes.py hoặc dnse_stream.py.
-#
-# Ví dụ:
-# from scripts.footprint.engine import footprint_engine
-#
-# Không tạo một FootprintEngine mới ở mỗi request Flask,
-# nếu không dữ liệu sẽ bị phân tán giữa nhiều instance.
+def _build_default_persistence() -> Any:
+    """
+    Tạo LocalStore mặc định nếu module tồn tại.
 
-footprint_engine = FootprintEngine()
+    Nếu LocalStore không import được, engine vẫn chạy RAM-only.
+    """
+    try:
+        from scripts.footprint.local_store import get_local_store
+
+        return get_local_store()
+
+    except ImportError:
+        logger.warning(
+            "Không tìm thấy LocalStore; Footprint Engine chạy RAM-only."
+        )
+        return None
+
+    except Exception:
+        logger.exception(
+            "Không thể khởi tạo LocalStore; Footprint Engine chạy RAM-only."
+        )
+        return None
 
 
-# Alias để hỗ trợ code cũ nếu trước đây bạn đã import tên engine.
+_default_persistence = _build_default_persistence()
+
+footprint_engine = FootprintEngine(
+    persistence=_default_persistence,
+    engine_persists_trades=True,
+    recover_on_start=True,
+)
+
+# Alias tương thích với code cũ.
 engine = footprint_engine
+

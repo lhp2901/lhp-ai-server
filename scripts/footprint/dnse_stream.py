@@ -5,31 +5,39 @@ DNSE REALTIME FOOTPRINT STREAM
 File:
     scripts/footprint/dnse_stream.py
 
-Nhiệm vụ:
-    1. Kết nối DNSE WebSocket bằng TradingClient.
-    2. Xác thực bằng DNSE API Key và API Secret.
-    3. Đăng ký nhận dữ liệu trade_extra.
-    4. Chuẩn hóa dữ liệu giao dịch.
-    5. Đưa dữ liệu vào footprint_engine.
-    6. Tự kết nối lại khi gặp lỗi.
-    7. Cung cấp start(), stop(), get_status() cho Flask routes.
+Data flow:
+    DNSE WebSocket
+        -> Normalize trade
+        -> Validate symbol
+        -> Persist to SQLite
+        -> Update footprint_engine
+        -> Flask API / Next.js
 
-Yêu cầu:
-    - scripts/footprint/config.py
-    - scripts/footprint/engine.py
-    - DNSE OpenAPI Python SDK có TradingClient
-    - Python 3.10+ được khuyến nghị
+Features:
+    - Background asyncio event loop.
+    - DNSE WebSocket reconnect with exponential backoff and jitter.
+    - Flexible DNSE payload normalization.
+    - Timestamp normalization to Unix seconds.
+    - SQLite persistence before Engine update.
+    - Persistence and Engine metrics.
+    - Thread-safe status reporting.
+    - Graceful stop.
+    - Compatible with the existing Flask routes.
 
-Lưu ý:
-    Footprint Delta chỉ chính xác khi xác định được bên chủ động mua/bán
-    từ dữ liệu đáng tin cậy. Nếu không xác định được, side = UNKNOWN.
+Important:
+    - Trade side is UNKNOWN unless reliably identified.
+    - SQLite persistence does not automatically restore Engine RAM.
+    - Trades without provider trade IDs cannot always be deduplicated safely.
+    - Historical recovery requires Engine-compatible replay logic.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
+import random
 import threading
 import time
 
@@ -45,24 +53,22 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(
+    handler = logging.StreamHandler()
+    handler.setFormatter(
         logging.Formatter(
-            "%(asctime)s | DNSE-FOOTPRINT | "
-            "%(levelname)s | %(message)s"
+            "%(asctime)s | DNSE-FOOTPRINT | %(levelname)s | %(message)s"
         )
     )
-    logger.addHandler(_handler)
+    logger.addHandler(handler)
 
 logger.setLevel(logging.INFO)
 
 
 # ============================================================
-# 2. IMPORT CONFIG VÀ FOOTPRINT ENGINE
+# 2. PROJECT IMPORTS
 # ============================================================
 
 from scripts.footprint import config as cfg
-
 from scripts.footprint.engine import footprint_engine
 
 
@@ -71,17 +77,10 @@ from scripts.footprint.engine import footprint_engine
 # ============================================================
 
 def _config_value(name: str, default: Any = None) -> Any:
-    """
-    Đọc biến cấu hình bằng getattr để tránh lỗi import
-    nếu config.py không định nghĩa một biến tùy chọn.
-    """
     return getattr(cfg, name, default)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
-    """
-    Chuyển đổi giá trị cấu hình thành bool an toàn.
-    """
     if value is None:
         return default
 
@@ -91,12 +90,12 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
 
-    normalized = str(value).strip().lower()
+    text = str(value).strip().lower()
 
-    if normalized in {"1", "true", "yes", "y", "on"}:
+    if text in {"1", "true", "yes", "y", "on"}:
         return True
 
-    if normalized in {"0", "false", "no", "n", "off"}:
+    if text in {"0", "false", "no", "n", "off"}:
         return False
 
     return default
@@ -111,17 +110,38 @@ def _as_float(value: Any, default: float) -> float:
 
         return result
 
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
-def _as_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
+def _parse_symbols(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = value.split(",")
 
-    except (TypeError, ValueError):
-        return default
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
 
+    else:
+        values = []
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for item in values:
+        symbol = str(item or "").strip().upper()
+
+        if not symbol or symbol in seen:
+            continue
+
+        seen.add(symbol)
+        result.append(symbol)
+
+    return result
+
+
+# ============================================================
+# 4. DNSE CONFIGURATION
+# ============================================================
 
 DNSE_API_KEY = str(
     _config_value("DNSE_API_KEY", "") or ""
@@ -135,8 +155,13 @@ DNSE_WS_URL = str(
     _config_value(
         "DNSE_WS_URL",
         "wss://ws-openapi.dnse.com.vn",
-    )
+    ) or ""
 ).strip().rstrip("/")
+
+DNSE_AUTO_RECONNECT = _as_bool(
+    _config_value("DNSE_AUTO_RECONNECT", True),
+    True,
+)
 
 DNSE_RECONNECT_BASE_SECONDS = max(
     1.0,
@@ -162,71 +187,167 @@ DNSE_CONNECT_TIMEOUT_SECONDS = max(
     ),
 )
 
-DNSE_AUTO_RECONNECT = _as_bool(
-    _config_value("DNSE_AUTO_RECONNECT", True),
-    True,
-)
-
 FOOTPRINT_BOARD_ID = str(
     _config_value("FOOTPRINT_BOARD_ID", "G1") or "G1"
 ).strip()
 
-FOOTPRINT_SYMBOLS = _config_value(
-    "FOOTPRINT_SYMBOLS",
-    ["HPG", "FPT", "SSI", "DXG"],
+FOOTPRINT_SYMBOLS = _parse_symbols(
+    _config_value(
+        "FOOTPRINT_SYMBOLS",
+        ["HPG", "FPT", "SSI", "DXG"],
+    )
 )
 
-if isinstance(FOOTPRINT_SYMBOLS, str):
-    FOOTPRINT_SYMBOLS = [
-        item.strip().upper()
-        for item in FOOTPRINT_SYMBOLS.split(",")
-        if item.strip()
-    ]
-
-else:
-    FOOTPRINT_SYMBOLS = [
-        str(item).strip().upper()
-        for item in FOOTPRINT_SYMBOLS
-        if str(item).strip()
-    ]
-
-# Loại bỏ mã trùng lặp nhưng vẫn giữ thứ tự ban đầu.
-FOOTPRINT_SYMBOLS = list(dict.fromkeys(FOOTPRINT_SYMBOLS))
-
-# Khoảng chờ giữa các lần thử kết nối.
-RECONNECT_BASE = DNSE_RECONNECT_BASE_SECONDS
-RECONNECT_MAX = DNSE_RECONNECT_MAX_SECONDS
-
-# Chỉ bật nếu config.py có biến tương ứng.
 FOOTPRINT_LOG_EVERY_TRADE = _as_bool(
     _config_value("FOOTPRINT_LOG_EVERY_TRADE", False),
     False,
 )
 
+FOOTPRINT_REQUIRE_PERSISTENCE = _as_bool(
+    _config_value("FOOTPRINT_REQUIRE_PERSISTENCE", True),
+    True,
+)
+
+RECONNECT_JITTER_SECONDS = max(
+    0.0,
+    _as_float(
+        _config_value("DNSE_RECONNECT_JITTER_SECONDS", 1.0),
+        1.0,
+    ),
+)
+
+# Chỉ dùng khi SDK thực sự hỗ trợ thuộc tính này.
+DNSE_CLIENT_RUNNING_ATTRIBUTE = "_is_running"
+
 
 # ============================================================
-# 4. GENERIC DATA HELPERS
+# 5. SQLITE STORE
+# ============================================================
+
+def _get_store() -> Any:
+    """
+    Resolve LocalStore lazily.
+
+    Expected interface:
+        get_local_store()
+        store.save_trade(trade)
+        store.get_storage_status()
+    """
+    from scripts.footprint.local_store import get_local_store
+
+    return get_local_store()
+
+
+def _persist_trade(trade: dict[str, Any]) -> dict[str, Any]:
+    """
+    Persist a normalized trade.
+
+    Returns a structured result:
+        {
+            "success": bool,
+            "inserted": bool | None,
+            "duplicate": bool,
+            "reason": str | None,
+        }
+
+    Compatibility:
+        - True from LocalStore means inserted.
+        - False is ambiguous in the existing LocalStore API.
+        - None is not treated as success.
+        - A dict can explicitly distinguish duplicate and insert.
+    """
+    store = _get_store()
+    result = store.save_trade(trade)
+
+    if isinstance(result, dict):
+        duplicate = result.get("duplicate") is True
+        inserted = result.get("inserted") is True
+        success = (
+            result.get("success") is True
+            or inserted
+            or duplicate
+        )
+
+        return {
+            "success": success,
+            "inserted": inserted,
+            "duplicate": duplicate,
+            "reason": result.get("reason"),
+        }
+
+    if result is True:
+        return {
+            "success": True,
+            "inserted": True,
+            "duplicate": False,
+            "reason": None,
+        }
+
+    if result is False:
+        # Existing LocalStore returns False for duplicate/rejected
+        # inserts. It does not provide enough information to tell
+        # a duplicate from a real storage failure.
+        return {
+            "success": False,
+            "inserted": False,
+            "duplicate": False,
+            "reason": (
+                "LocalStore returned False; duplicate and storage "
+                "failure cannot be distinguished by this interface."
+            ),
+        }
+
+    return {
+        "success": False,
+        "inserted": False,
+        "duplicate": False,
+        "reason": (
+            f"Unexpected save_trade return type: "
+            f"{type(result).__name__}"
+        ),
+    }
+
+
+def _store_status() -> dict[str, Any]:
+    try:
+        store = _get_store()
+        method = getattr(store, "get_storage_status", None)
+
+        if callable(method):
+            result = method()
+
+            if isinstance(result, dict):
+                return result
+
+        return {
+            "available": True,
+            "healthy": None,
+            "message": "SQLite store loaded; health not confirmed.",
+        }
+
+    except Exception as exc:
+        return {
+            "available": False,
+            "healthy": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+# ============================================================
+# 6. PAYLOAD HELPERS
 # ============================================================
 
 def _read_field(data: Any, *names: str) -> Any:
-    """
-    Đọc field từ:
-        - dict
-        - object thông thường
-        - Pydantic model
-        - object có model_dump() hoặc dict()
-
-    Trả về giá trị đầu tiên tìm thấy.
-    """
     if data is None:
         return None
 
     if isinstance(data, dict):
         for name in names:
-            if name in data and data[name] is not None:
-                return data[name]
+            value = data.get(name)
 
-        # Hỗ trợ tên field không phân biệt chữ hoa/thường.
+            if value is not None:
+                return value
+
         lower_map = {
             str(key).lower(): value
             for key, value in data.items()
@@ -258,7 +379,10 @@ def _read_field(data: Any, *names: str) -> Any:
                 converted = method()
 
                 if isinstance(converted, dict):
-                    return _read_field(converted, *names)
+                    value = _read_field(converted, *names)
+
+                    if value is not None:
+                        return value
 
         except Exception:
             continue
@@ -276,12 +400,6 @@ def _read_field(data: Any, *names: str) -> Any:
 
 
 def _object_to_dict(data: Any) -> dict[str, Any]:
-    """
-    Chuyển object DNSE thành dict để log hoặc xử lý.
-
-    Không dùng str(object) làm dữ liệu giao dịch vì
-    kết quả đó không đảm bảo đúng cấu trúc.
-    """
     if isinstance(data, dict):
         return dict(data)
 
@@ -310,18 +428,24 @@ def _object_to_dict(data: Any) -> dict[str, Any]:
     return {}
 
 
+def _first_nonempty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        return value
+
+    return None
+
+
 def _to_decimal(
     value: Any,
     *,
     default: Optional[Decimal] = None,
 ) -> Optional[Decimal]:
-    """
-    Chuyển số thành Decimal.
-
-    Không tự đổi đơn vị giá hoặc khối lượng tại đây.
-    Việc chuyển đơn vị phải dựa trên tài liệu dữ liệu DNSE
-    và cấu trúc mà engine.py đang sử dụng.
-    """
     if value is None or isinstance(value, bool):
         return default
 
@@ -337,70 +461,58 @@ def _to_decimal(
         return default
 
 
-def _to_float(value: Any) -> Optional[float]:
-    decimal_value = _to_decimal(value)
-
-    if decimal_value is None:
-        return None
-
-    return float(decimal_value)
-
-
-def _first_nonempty(*values: Any) -> Any:
-    for value in values:
-        if value is None:
-            continue
-
-        if isinstance(value, str) and not value.strip():
-            continue
-
-        return value
-
-    return None
-
-
 # ============================================================
-# 5. TIMESTAMP NORMALIZATION
+# 7. TIMESTAMP NORMALIZATION
 # ============================================================
 
-def _normalize_timestamp(value: Any) -> Any:
+def _normalize_timestamp(value: Any) -> Optional[float]:
     """
-    Chuẩn hóa timestamp về Unix seconds.
+    Normalize timestamp to Unix seconds.
 
-    Hỗ trợ:
+    Supports:
+        - datetime
         - Unix seconds
         - Unix milliseconds
         - Unix microseconds
-        - datetime
-        - ISO timestamp string
+        - ISO-8601 strings
 
-    Nếu không đọc được timestamp, dùng thời điểm hiện tại.
-
-    Lưu ý:
-        Giá trị timestamp từ SDK cần được kiểm tra theo
-        tài liệu của phiên bản SDK đang cài đặt.
+    Invalid supplied timestamps return None.
     """
     if value is None:
-        return time.time()
+        return None
 
     if isinstance(value, datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
 
-        return value.timestamp()
+        result = value.timestamp()
+
+        if 946684800 <= result <= 4102444800:
+            return result
+
+        return None
 
     if isinstance(value, (int, float, Decimal)):
-        number = float(value)
+        try:
+            number = float(value)
 
-        if not math.isfinite(number):
-            return time.time()
+        except (ValueError, TypeError, OverflowError):
+            return None
 
-        # Phải kiểm tra microseconds trước milliseconds.
+        if not math.isfinite(number) or number <= 0:
+            return None
+
+        # Microseconds -> seconds.
         if number >= 100_000_000_000_000:
-            return number / 1_000_000
+            number /= 1_000_000
 
-        if number >= 100_000_000_000:
-            return number / 1_000
+        # Milliseconds -> seconds.
+        elif number >= 100_000_000_000:
+            number /= 1_000
+
+        # Plausible range: 2000-01-01 to 2100-01-01.
+        if not 946684800 <= number <= 4102444800:
+            return None
 
         return number
 
@@ -408,44 +520,51 @@ def _normalize_timestamp(value: Any) -> Any:
         text = value.strip()
 
         if not text:
-            return time.time()
+            return None
 
-        # Chuỗi số: Unix timestamp.
         try:
             return _normalize_timestamp(float(text))
 
         except ValueError:
             pass
 
-        # ISO 8601.
         try:
-            normalized = text.replace("Z", "+00:00")
-            parsed = datetime.fromisoformat(normalized)
+            parsed = datetime.fromisoformat(
+                text.replace("Z", "+00:00")
+            )
 
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
 
-            return parsed.timestamp()
+            return _normalize_timestamp(parsed)
 
-        except ValueError:
-            pass
+        except (ValueError, OverflowError):
+            return None
 
-    return time.time()
+    return None
 
 
 # ============================================================
-# 6. SIDE NORMALIZATION
+# 8. SIDE NORMALIZATION
 # ============================================================
+
+def _configured_side_values(name: str) -> set[str]:
+    value = _config_value(name, [])
+
+    if isinstance(value, str):
+        value = value.split(",")
+
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+
+    return {
+        str(item).strip().upper()
+        for item in value
+        if str(item).strip()
+    }
+
 
 def _normalize_side(raw_side: Any) -> str:
-    """
-    Chuẩn hóa side thành BUY / SELL / UNKNOWN.
-
-    Chỉ nhận diện side từ field có ý nghĩa rõ ràng.
-    Không suy đoán side từ việc giá tăng/giảm.
-
-    Nếu DNSE không cung cấp side xác nhận, kết quả là UNKNOWN.
-    """
     if raw_side is None:
         return "UNKNOWN"
 
@@ -454,9 +573,6 @@ def _normalize_side(raw_side: Any) -> str:
     if not text:
         return "UNKNOWN"
 
-    # Một số biểu diễn phổ biến.
-    # Chỉ giữ các giá trị cần thiết và không diễn giải
-    # các mã chưa xác minh trong payload DNSE.
     buy_values = {
         "BUY",
         "B",
@@ -475,35 +591,17 @@ def _normalize_side(raw_side: Any) -> str:
         "SELL_INITIATED",
     }
 
-    # Cho phép cấu hình bổ sung các mã đã được xác minh
-    # từ tài liệu DNSE hoặc payload thực tế.
-    configured_buy_values = _config_value(
-        "FOOTPRINT_BUY_SIDE_VALUES",
-        [],
-    )
-
-    configured_sell_values = _config_value(
-        "FOOTPRINT_SELL_SIDE_VALUES",
-        [],
-    )
-
-    if isinstance(configured_buy_values, str):
-        configured_buy_values = configured_buy_values.split(",")
-
-    if isinstance(configured_sell_values, str):
-        configured_sell_values = configured_sell_values.split(",")
-
     buy_values.update(
-        str(value).strip().upper()
-        for value in configured_buy_values
-        if str(value).strip()
+        _configured_side_values("FOOTPRINT_BUY_SIDE_VALUES")
     )
 
     sell_values.update(
-        str(value).strip().upper()
-        for value in configured_sell_values
-        if str(value).strip()
+        _configured_side_values("FOOTPRINT_SELL_SIDE_VALUES")
     )
+
+    # Conflicting configuration must not produce a guessed side.
+    if text in buy_values and text in sell_values:
+        return "UNKNOWN"
 
     if text in buy_values:
         return "BUY"
@@ -515,38 +613,30 @@ def _normalize_side(raw_side: Any) -> str:
 
 
 # ============================================================
-# 7. DNSE PAYLOAD NORMALIZATION
+# 9. TRADE NORMALIZATION
 # ============================================================
 
 def normalize_dnse_trade(data: Any) -> Optional[dict[str, Any]]:
     """
-    Chuẩn hóa một tick DNSE thành cấu trúc mà engine.py hỗ trợ.
+    Convert a DNSE payload into a normalized trade.
 
-    Output:
-        {
-            "symbol": "HPG",
-            "price": 27000,
-            "quantity": 100,
-            "side": "BUY" | "SELL" | "UNKNOWN",
-            "timestamp": 1234567890.0,
-            "trade_id": "..."
-        }
-
-    Tên field bên dưới bao gồm các alias thường gặp.
-    Tuy nhiên, cần xác minh tên field thực tế bằng payload
-    từ phiên bản DNSE SDK đang chạy.
-
-    Không coi các số liệu tổng hợp trong trade_extra là
-    một giao dịch riêng lẻ nếu chúng không đại diện cho tick.
+    Output fields:
+        symbol, price, quantity, volume, side, timestamp,
+        trade_id, timestamp_source, received_at
     """
     if data is None:
         return None
 
-    # --------------------------------------------------------
-    # 7.1. Symbol
-    # --------------------------------------------------------
+    # Handle SDK wrappers.
+    nested = _read_field(data, "payload", "data", "trade")
 
-    symbol = _first_nonempty(
+    if nested is not None and nested is not data:
+        nested_trade = normalize_dnse_trade(nested)
+
+        if nested_trade is not None:
+            return nested_trade
+
+    symbol_value = _first_nonempty(
         _read_field(
             data,
             "symbol",
@@ -558,17 +648,13 @@ def normalize_dnse_trade(data: Any) -> Optional[dict[str, Any]]:
         )
     )
 
-    if symbol is None:
+    if symbol_value is None:
         return None
 
-    symbol = str(symbol).strip().upper()
+    symbol = str(symbol_value).strip().upper()
 
     if not symbol:
         return None
-
-    # --------------------------------------------------------
-    # 7.2. Price
-    # --------------------------------------------------------
 
     raw_price = _first_nonempty(
         _read_field(
@@ -586,15 +672,7 @@ def normalize_dnse_trade(data: Any) -> Optional[dict[str, Any]]:
     price = _to_decimal(raw_price)
 
     if price is None or price <= 0:
-        logger.debug(
-            "Bỏ tick vì không có giá hợp lệ. symbol=%s",
-            symbol,
-        )
         return None
-
-    # --------------------------------------------------------
-    # 7.3. Quantity / volume
-    # --------------------------------------------------------
 
     raw_quantity = _first_nonempty(
         _read_field(
@@ -614,15 +692,7 @@ def normalize_dnse_trade(data: Any) -> Optional[dict[str, Any]]:
     quantity = _to_decimal(raw_quantity)
 
     if quantity is None or quantity <= 0:
-        logger.debug(
-            "Bỏ tick vì không có khối lượng hợp lệ. symbol=%s",
-            symbol,
-        )
         return None
-
-    # --------------------------------------------------------
-    # 7.4. Timestamp
-    # --------------------------------------------------------
 
     raw_timestamp = _first_nonempty(
         _read_field(
@@ -642,9 +712,17 @@ def normalize_dnse_trade(data: Any) -> Optional[dict[str, Any]]:
 
     timestamp = _normalize_timestamp(raw_timestamp)
 
-    # --------------------------------------------------------
-    # 7.5. Trade ID
-    # --------------------------------------------------------
+    if timestamp is None:
+        # A missing timestamp may use receive time. A supplied but
+        # invalid timestamp is rejected rather than silently replaced.
+        if raw_timestamp is not None:
+            return None
+
+        timestamp = time.time()
+        timestamp_source = "received"
+
+    else:
+        timestamp_source = "exchange"
 
     raw_trade_id = _first_nonempty(
         _read_field(
@@ -665,13 +743,9 @@ def normalize_dnse_trade(data: Any) -> Optional[dict[str, Any]]:
         else None
     )
 
-    # --------------------------------------------------------
-    # 7.6. Side
-    # --------------------------------------------------------
+    if not trade_id:
+        trade_id = None
 
-    # Chỉ đọc các field được đặt tên rõ ràng là side hoặc
-    # aggressor/active side. Không sử dụng màu nến hoặc
-    # biến động giá để đoán bên mua/bán.
     raw_side = _first_nonempty(
         _read_field(
             data,
@@ -689,44 +763,33 @@ def normalize_dnse_trade(data: Any) -> Optional[dict[str, Any]]:
 
     side = _normalize_side(raw_side)
 
-    # --------------------------------------------------------
-    # 7.7. Normalized result
-    # --------------------------------------------------------
+    received_at = time.time()
 
     return {
         "symbol": symbol,
         "price": float(price),
         "quantity": float(quantity),
+        "volume": float(quantity),
         "side": side,
         "timestamp": timestamp,
         "trade_id": trade_id,
+        "timestamp_source": timestamp_source,
+        "received_at": received_at,
     }
 
 
 # ============================================================
-# 8. DNSE STREAM MANAGER
+# 10. STREAM MANAGER
 # ============================================================
 
 class DNSEFootprintStream:
-    """
-    Quản lý vòng đời DNSE WebSocket trong thread riêng.
-
-    API công khai:
-        start()
-        stop()
-        get_status()
-
-    Singleton ở cuối file:
-        stream
-    """
+    """Manage one DNSE WebSocket connection in a background thread."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
 
         self._thread: Optional[threading.Thread] = None
-
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-
         self._client: Any = None
 
         self._stop_event = threading.Event()
@@ -734,10 +797,18 @@ class DNSEFootprintStream:
         self._started = False
         self._connected = False
         self._authenticated = False
+        self._subscribed = False
+        self._sdk_available = False
 
         self._last_error: Optional[str] = None
+
         self._last_message_at: Optional[float] = None
         self._last_trade_at: Optional[float] = None
+        self._last_persisted_at: Optional[float] = None
+        self._last_engine_update_at: Optional[float] = None
+
+        self._started_at: Optional[float] = None
+        self._connected_at: Optional[float] = None
 
         self._connect_count = 0
         self._disconnect_count = 0
@@ -746,66 +817,58 @@ class DNSEFootprintStream:
         self._received_count = 0
         self._accepted_count = 0
         self._rejected_count = 0
-
+        self._duplicate_count = 0
+        self._persistence_error_count = 0
+        self._engine_error_count = 0
         self._unknown_side_count = 0
 
-        self._started_at: Optional[float] = None
+        self._persisted_count = 0
+        self._engine_updated_count = 0
 
-        self._current_symbols: list[str] = list(
-            FOOTPRINT_SYMBOLS
-        )
-
-        self._sdk_available = False
+        self._current_symbols = list(FOOTPRINT_SYMBOLS)
 
     # --------------------------------------------------------
-    # 8.1. Public: start
+    # Start
     # --------------------------------------------------------
 
     def start(self) -> bool:
-        """
-        Khởi chạy stream.
-
-        Không block Flask request.
-        Nếu stream đã chạy thì không tạo thêm kết nối.
-        """
         with self._lock:
-            if (
-                self._thread is not None
-                and self._thread.is_alive()
-                and self._started
-            ):
-                logger.info(
-                    "DNSE Footprint stream đang chạy."
+            if self._thread and self._thread.is_alive():
+                if self._started:
+                    return True
+
+                self._last_error = (
+                    "Stream thread is still shutting down."
                 )
-                return True
+                return False
 
             if not DNSE_API_KEY or not DNSE_API_SECRET:
                 self._last_error = (
-                    "Thiếu DNSE_API_KEY hoặc DNSE_API_SECRET "
-                    "trong file môi trường/config."
+                    "Thiếu DNSE_API_KEY hoặc DNSE_API_SECRET."
                 )
+                logger.error(self._last_error)
+                return False
 
+            if not DNSE_WS_URL:
+                self._last_error = "DNSE_WS_URL chưa được cấu hình."
                 logger.error(self._last_error)
                 return False
 
             if not FOOTPRINT_SYMBOLS:
-                self._last_error = (
-                    "FOOTPRINT_SYMBOLS đang rỗng. "
-                    "Hãy cấu hình danh sách mã cổ phiếu."
-                )
-
+                self._last_error = "FOOTPRINT_SYMBOLS đang rỗng."
                 logger.error(self._last_error)
                 return False
 
             self._stop_event.clear()
 
             self._started = True
+            self._connected = False
+            self._authenticated = False
+            self._subscribed = False
+
             self._started_at = time.time()
             self._last_error = None
-
-            self._current_symbols = list(
-                FOOTPRINT_SYMBOLS
-            )
+            self._current_symbols = list(FOOTPRINT_SYMBOLS)
 
             self._thread = threading.Thread(
                 target=self._thread_main,
@@ -816,7 +879,7 @@ class DNSEFootprintStream:
             self._thread.start()
 
             logger.info(
-                "Đã yêu cầu khởi động DNSE stream. symbols=%s, board=%s",
+                "Đã khởi động DNSE stream: symbols=%s, board=%s",
                 self._current_symbols,
                 FOOTPRINT_BOARD_ID,
             )
@@ -824,38 +887,38 @@ class DNSEFootprintStream:
             return True
 
     # --------------------------------------------------------
-    # 8.2. Public: stop
+    # Stop
     # --------------------------------------------------------
 
     def stop(self, timeout: float = 15.0) -> bool:
-        """
-        Yêu cầu dừng stream và đóng kết nối SDK.
-
-        timeout chỉ giới hạn thời gian chờ thread kết thúc;
-        nó không đảm bảo đóng socket ngay lập tức nếu SDK
-        đang bị kẹt ở một thao tác mạng.
-        """
-        logger.info("Đang yêu cầu dừng DNSE stream...")
-
         self._stop_event.set()
 
-        loop = self._loop
-        client = self._client
+        with self._lock:
+            loop = self._loop
+            client = self._client
+            thread = self._thread
 
-        if loop is not None and loop.is_running():
-            if client is not None:
+        if (
+            loop is not None
+            and loop.is_running()
+            and client is not None
+        ):
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._disconnect_client(client),
+                    loop,
+                )
+
                 try:
-                    asyncio.run_coroutine_threadsafe(
-                        self._disconnect_client(client),
-                        loop,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Không thể gửi lệnh disconnect: %s",
-                        exc,
-                    )
+                    future.result(timeout=3.0)
+                except Exception:
+                    pass
 
-        thread = self._thread
+            except Exception:
+                logger.debug(
+                    "Không gửi được lệnh disconnect tới DNSE client.",
+                    exc_info=True,
+                )
 
         if (
             thread is not None
@@ -869,42 +932,32 @@ class DNSEFootprintStream:
                 self._started = False
                 self._connected = False
                 self._authenticated = False
-
-                logger.info(
-                    "DNSE stream đã dừng."
-                )
-
+                self._subscribed = False
                 return True
 
-            logger.warning(
-                "DNSE stream chưa kết thúc sau %.1f giây.",
-                timeout,
+            self._last_error = (
+                "Stop requested, but stream thread did not exit "
+                "within the timeout."
             )
 
             return False
 
     # --------------------------------------------------------
-    # 8.3. Public: status
+    # Status
     # --------------------------------------------------------
 
     def get_status(self) -> dict[str, Any]:
-        """
-        Trả về trạng thái cho routes.py.
-
-        Không trả API Key hoặc API Secret.
-        """
         with self._lock:
             thread_alive = bool(
                 self._thread and self._thread.is_alive()
             )
 
-            return {
-                "running": bool(
-                    self._started and thread_alive
-                ),
+            result: dict[str, Any] = {
+                "running": bool(self._started and thread_alive),
                 "started": self._started,
                 "connected": self._connected,
                 "authenticated": self._authenticated,
+                "subscribed": self._subscribed,
                 "sdk_available": self._sdk_available,
                 "websocket_url": DNSE_WS_URL,
                 "board_id": FOOTPRINT_BOARD_ID,
@@ -916,44 +969,50 @@ class DNSEFootprintStream:
                 "received_count": self._received_count,
                 "accepted_count": self._accepted_count,
                 "rejected_count": self._rejected_count,
+                "duplicate_count": self._duplicate_count,
+                "persistence_error_count": (
+                    self._persistence_error_count
+                ),
+                "engine_error_count": self._engine_error_count,
                 "unknown_side_count": self._unknown_side_count,
+                "persisted_count": self._persisted_count,
+                "engine_updated_count": self._engine_updated_count,
                 "last_message_at": self._last_message_at,
                 "last_trade_at": self._last_trade_at,
+                "last_persisted_at": self._last_persisted_at,
+                "last_engine_update_at": self._last_engine_update_at,
                 "last_error": self._last_error,
                 "started_at": self._started_at,
+                "connected_at": self._connected_at,
                 "thread_alive": thread_alive,
+                "persistence_required": FOOTPRINT_REQUIRE_PERSISTENCE,
             }
 
+        # Query SQLite outside the stream lock.
+        result["storage"] = _store_status()
+
+        return result
+
     # --------------------------------------------------------
-    # 8.4. Thread entry point
+    # Thread entry
     # --------------------------------------------------------
 
     def _thread_main(self) -> None:
-        """
-        Tạo event loop riêng trong background thread.
-
-        Flask tiếp tục xử lý API request bình thường.
-        """
         loop = asyncio.new_event_loop()
-
         asyncio.set_event_loop(loop)
 
         with self._lock:
             self._loop = loop
 
         try:
-            loop.run_until_complete(
-                self._run_forever()
-            )
+            loop.run_until_complete(self._run_forever())
 
         except Exception as exc:
             self._record_error(
-                f"Lỗi nghiêm trọng trong stream thread: {exc}"
+                f"Stream thread failed: {type(exc).__name__}: {exc}"
             )
 
-            logger.exception(
-                "DNSE stream thread gặp lỗi."
-            )
+            logger.exception("DNSE stream thread failed.")
 
         finally:
             try:
@@ -971,11 +1030,13 @@ class DNSEFootprintStream:
                     )
 
             except Exception:
-                pass
+                logger.debug(
+                    "Error cleaning pending asyncio tasks.",
+                    exc_info=True,
+                )
 
             try:
                 loop.close()
-
             except Exception:
                 pass
 
@@ -984,34 +1045,27 @@ class DNSEFootprintStream:
                 self._client = None
                 self._connected = False
                 self._authenticated = False
+                self._subscribed = False
                 self._started = False
 
-            logger.info(
-                "DNSE stream thread đã kết thúc."
-            )
+            logger.info("DNSE stream thread đã kết thúc.")
 
     # --------------------------------------------------------
-    # 8.5. Reconnection loop
+    # Reconnect loop
     # --------------------------------------------------------
 
     async def _run_forever(self) -> None:
-        """
-        Vòng lặp kết nối.
-
-        SDK có auto_reconnect riêng; vòng lặp ngoài này bổ sung
-        khả năng khởi tạo lại client nếu phiên kết nối kết thúc
-        hoặc quá trình connect/subscribe thất bại.
-        """
         attempt = 0
 
         while not self._stop_event.is_set():
             client = None
+            was_connected = False
 
             try:
                 attempt += 1
 
                 logger.info(
-                    "Đang kết nối DNSE. Lần thử #%s",
+                    "Đang kết nối DNSE, lần thử #%s.",
                     attempt,
                 )
 
@@ -1026,7 +1080,8 @@ class DNSEFootprintStream:
                     self._client = client
                     self._connected = True
                     self._authenticated = True
-
+                    self._subscribed = True
+                    self._connected_at = time.time()
                     self._connect_count += 1
 
                     if attempt > 1:
@@ -1034,61 +1089,57 @@ class DNSEFootprintStream:
 
                     self._last_error = None
 
+                was_connected = True
+
                 logger.info(
-                    "DNSE WebSocket đã kết nối và đăng ký dữ liệu. "
-                    "symbols=%s, board=%s",
+                    "DNSE subscription đã được thiết lập: %s",
                     self._current_symbols,
-                    FOOTPRINT_BOARD_ID,
                 )
 
-                # Duy trì client cho đến khi nhận yêu cầu dừng
-                # hoặc SDK kết thúc kết nối.
+                # The SDK callback is expected to deliver trades.
+                # Monitor the client until stopped or disconnected.
                 while not self._stop_event.is_set():
                     await asyncio.sleep(1)
 
-                    # Kiểm tra trạng thái nội bộ nếu SDK cung cấp.
                     is_running = getattr(
                         client,
-                        "_is_running",
+                        DNSE_CLIENT_RUNNING_ATTRIBUTE,
                         None,
                     )
 
                     if is_running is False:
                         raise ConnectionError(
-                            "DNSE SDK báo WebSocket không còn chạy."
+                            "DNSE SDK báo WebSocket đã dừng."
                         )
 
             except asyncio.CancelledError:
                 raise
 
             except Exception as exc:
-                message = (
+                self._record_error(
                     f"{type(exc).__name__}: {exc}"
                 )
 
-                self._record_error(message)
-
-                logger.exception(
-                    "DNSE connect/subscribe loop gặp lỗi."
-                )
+                logger.exception("DNSE connection/stream error.")
 
             finally:
                 if client is not None:
                     try:
                         await self._disconnect_client(client)
 
-                    except Exception as exc:
-                        logger.warning(
-                            "Lỗi khi đóng DNSE client: %s",
-                            exc,
+                    except Exception:
+                        logger.debug(
+                            "Error disconnecting DNSE client.",
+                            exc_info=True,
                         )
 
                 with self._lock:
-                    if self._connected:
+                    if was_connected:
                         self._disconnect_count += 1
 
                     self._connected = False
                     self._authenticated = False
+                    self._subscribed = False
 
                     if self._client is client:
                         self._client = None
@@ -1098,40 +1149,40 @@ class DNSEFootprintStream:
 
             if not DNSE_AUTO_RECONNECT:
                 logger.warning(
-                    "DNSE_AUTO_RECONNECT=false; không thử lại."
+                    "DNSE_AUTO_RECONNECT=false; dừng vòng lặp."
                 )
                 break
 
+            exponent = min(max(attempt - 1, 0), 8)
+
             delay = min(
-                RECONNECT_BASE * (2 ** min(attempt - 1, 8)),
-                RECONNECT_MAX,
+                DNSE_RECONNECT_BASE_SECONDS * (2 ** exponent),
+                DNSE_RECONNECT_MAX_SECONDS,
             )
 
+            if RECONNECT_JITTER_SECONDS:
+                delay += random.uniform(
+                    0.0,
+                    RECONNECT_JITTER_SECONDS,
+                )
+
             logger.warning(
-                "Thử kết nối lại DNSE sau %.1f giây.",
+                "Thử kết nối lại sau %.2f giây.",
                 delay,
             )
 
-            # Dùng Event để có thể dừng ngay trong thời gian chờ.
             await self._async_wait_or_stop(delay)
 
         with self._lock:
             self._connected = False
             self._authenticated = False
+            self._subscribed = False
 
     # --------------------------------------------------------
-    # 8.6. Create client and subscribe
+    # Create and subscribe
     # --------------------------------------------------------
 
     async def _create_and_subscribe(self) -> Any:
-        """
-        Khởi tạo DNSE TradingClient, connect và subscribe.
-
-        Theo SDK DNSE:
-            from dnse import TradingClient
-            await client.connect()
-            await client.subscribe_trade_extra(...)
-        """
         try:
             from dnse import TradingClient
 
@@ -1141,8 +1192,7 @@ class DNSEFootprintStream:
             self._sdk_available = False
 
             raise RuntimeError(
-                "Không import được TradingClient từ package dnse. "
-                "Hãy kiểm tra đã cài đúng DNSE OpenAPI SDK hay chưa."
+                "Không import được TradingClient từ package dnse."
             ) from exc
 
         client = TradingClient(
@@ -1156,15 +1206,13 @@ class DNSEFootprintStream:
         )
 
         try:
-            await asyncio.wait_for(
-                client.connect(),
-                timeout=DNSE_CONNECT_TIMEOUT_SECONDS,
-            )
+            connect_result = client.connect()
 
-            # SDK connect() hoàn tất sau khi kết nối và xác thực.
-            logger.info(
-                "DNSE client.connect() hoàn tất."
-            )
+            if inspect.isawaitable(connect_result):
+                await asyncio.wait_for(
+                    connect_result,
+                    timeout=DNSE_CONNECT_TIMEOUT_SECONDS,
+                )
 
             subscribe_method = getattr(
                 client,
@@ -1174,62 +1222,47 @@ class DNSEFootprintStream:
 
             if not callable(subscribe_method):
                 raise RuntimeError(
-                    "TradingClient không có subscribe_trade_extra(). "
-                    "Kiểm tra phiên bản SDK đang cài đặt."
+                    "TradingClient không có subscribe_trade_extra()."
                 )
 
-            await subscribe_method(
+            subscribe_result = subscribe_method(
                 symbols=self._current_symbols,
                 on_trade_extra=self._on_trade_extra,
                 encoding="json",
                 board_id=FOOTPRINT_BOARD_ID,
             )
 
-            logger.info(
-                "Đã gửi đăng ký trade_extra: symbols=%s, board=%s",
-                self._current_symbols,
-                FOOTPRINT_BOARD_ID,
-            )
+            if inspect.isawaitable(subscribe_result):
+                await asyncio.wait_for(
+                    subscribe_result,
+                    timeout=DNSE_CONNECT_TIMEOUT_SECONDS,
+                )
 
             return client
 
         except Exception:
             try:
                 await self._disconnect_client(client)
-
             except Exception:
                 pass
 
             raise
 
     # --------------------------------------------------------
-    # 8.7. Disconnect helper
+    # Disconnect
     # --------------------------------------------------------
 
     async def _disconnect_client(self, client: Any) -> None:
-        """
-        Đóng kết nối DNSE theo API SDK.
-
-        Hàm disconnect có thể chưa tồn tại ở một phiên bản
-        SDK khác, vì vậy kiểm tra trước khi gọi.
-        """
-        disconnect_method = getattr(
-            client,
-            "disconnect",
-            None,
-        )
+        disconnect_method = getattr(client, "disconnect", None)
 
         if not callable(disconnect_method):
             return
 
         result = disconnect_method()
 
-        if asyncio.iscoroutine(result):
+        if inspect.isawaitable(result):
             try:
-                await asyncio.wait_for(
-                    result,
-                    timeout=5.0,
-                )
+                await asyncio.wait_for(result, timeout=5.0)
 
             except asyncio.TimeoutError:
                 logger.warning(
@@ -1237,16 +1270,10 @@ class DNSEFootprintStream:
                 )
 
     # --------------------------------------------------------
-    # 8.8. Stop-aware async wait
+    # Stop-aware wait
     # --------------------------------------------------------
 
-    async def _async_wait_or_stop(
-        self,
-        seconds: float,
-    ) -> None:
-        """
-        Chờ tối đa seconds nhưng có thể thoát sớm khi stop().
-        """
+    async def _async_wait_or_stop(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
 
         while not self._stop_event.is_set():
@@ -1255,27 +1282,27 @@ class DNSEFootprintStream:
             if remaining <= 0:
                 return
 
-            await asyncio.sleep(
-                min(0.25, remaining)
-            )
+            await asyncio.sleep(min(0.25, remaining))
 
     # --------------------------------------------------------
-    # 8.9. Receive callback
+    # Receive callback
     # --------------------------------------------------------
 
     def _on_trade_extra(self, data: Any) -> None:
         """
-        Callback nhận một thông điệp trade_extra từ DNSE SDK.
+        Process one trade callback.
 
-        Callback SDK có thể chạy trong thread event loop.
-        Do đó:
-            - Không chạy tác vụ nặng ở đây.
-            - Không thực hiện request HTTP.
-            - Chỉ chuẩn hóa và đưa tick vào engine.
+        Ordering:
+            1. Count message.
+            2. Normalize and validate.
+            3. Persist to SQLite.
+            4. Update Engine if allowed.
         """
+        received_at = time.time()
+
         with self._lock:
             self._received_count += 1
-            self._last_message_at = time.time()
+            self._last_message_at = received_at
 
         try:
             normalized = normalize_dnse_trade(data)
@@ -1285,63 +1312,167 @@ class DNSEFootprintStream:
                     self._rejected_count += 1
 
                 logger.debug(
-                    "Không thể chuẩn hóa payload DNSE: %s",
+                    "Payload không hợp lệ: %s",
                     _object_to_dict(data),
                 )
-
                 return
 
             symbol = normalized["symbol"]
 
-            # Chỉ chấp nhận mã đang đăng ký.
-            # Tránh trộn dữ liệu của mã khác vào footprint.
-            if symbol not in self._current_symbols:
+            with self._lock:
+                subscribed_symbols = set(self._current_symbols)
+
+            if symbol not in subscribed_symbols:
+                with self._lock:
+                    self._rejected_count += 1
+
                 logger.debug(
-                    "Bỏ qua symbol không đăng ký: %s",
+                    "Bỏ qua mã chưa đăng ký: %s",
                     symbol,
                 )
                 return
 
-            # Engine sẽ xử lý deduplication, phân loại side,
-            # tổng hợp volume và xây dựng footprint.
-            accepted = footprint_engine.add_trade(
-                normalized
-            )
+            # ------------------------------------------------
+            # Persist before updating Engine.
+            # ------------------------------------------------
+            try:
+                persistence = _persist_trade(normalized)
 
-            if accepted is False:
+            except Exception as exc:
+                persistence = {
+                    "success": False,
+                    "inserted": False,
+                    "duplicate": False,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+
+                with self._lock:
+                    self._persistence_error_count += 1
+                    self._last_error = (
+                        "SQLite persistence error: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+                logger.exception(
+                    "Không lưu được giao dịch vào SQLite."
+                )
+
+            if persistence["duplicate"]:
+                # This branch is available only if LocalStore
+                # explicitly reports duplicates.
+                with self._lock:
+                    self._duplicate_count += 1
+
+                return
+
+            persisted = persistence["success"]
+
+            if not persisted:
+                if not persistence.get("reason", "").startswith(
+                    "LocalStore returned False"
+                ):
+                    with self._lock:
+                        self._persistence_error_count += 1
+
+                if FOOTPRINT_REQUIRE_PERSISTENCE:
+                    with self._lock:
+                        self._rejected_count += 1
+
+                    logger.error(
+                        "Bỏ qua Engine vì SQLite chưa xác nhận lưu: "
+                        "symbol=%s, trade_id=%s, reason=%s",
+                        symbol,
+                        normalized.get("trade_id"),
+                        persistence.get("reason"),
+                    )
+
+                    return
+
+                logger.warning(
+                    "SQLite chưa xác nhận lưu; vẫn cập nhật Engine "
+                    "vì FOOTPRINT_REQUIRE_PERSISTENCE=false."
+                )
+
+            else:
+                with self._lock:
+                    if persistence["inserted"]:
+                        self._persisted_count += 1
+
+                    self._last_persisted_at = time.time()
+
+            # ------------------------------------------------
+            # Update Engine.
+            # ------------------------------------------------
+            try:
+                result = footprint_engine.add_trade(normalized)
+
+            except Exception:
+                with self._lock:
+                    self._engine_error_count += 1
+                    self._last_error = (
+                        "Engine error while processing trade."
+                    )
+
+                logger.exception(
+                    "Engine không xử lý được trade %s.",
+                    normalized.get("trade_id"),
+                )
+                return
+
+            # Respect explicit rejection/duplicate results.
+            if result is False:
                 with self._lock:
                     self._rejected_count += 1
 
                 return
 
+            if isinstance(result, dict):
+                if result.get("duplicate") is True:
+                    with self._lock:
+                        self._duplicate_count += 1
+
+                    return
+
+                if result.get("accepted") is False:
+                    with self._lock:
+                        self._rejected_count += 1
+
+                    return
+
+            # Legacy Engine methods may return None. In that case
+            # this means no explicit rejection was reported; it
+            # does not prove deduplication or successful insertion.
             with self._lock:
                 self._accepted_count += 1
-                self._last_trade_at = time.time()
+                self._engine_updated_count += 1
+                self._last_trade_at = received_at
+                self._last_engine_update_at = time.time()
 
                 if normalized["side"] == "UNKNOWN":
                     self._unknown_side_count += 1
 
             if FOOTPRINT_LOG_EVERY_TRADE:
                 logger.info(
-                    "TICK | %s | price=%s | qty=%s | side=%s | id=%s",
+                    "TRADE | %s | price=%s | quantity=%s | "
+                    "side=%s | id=%s | ts=%s | persisted=%s",
                     normalized["symbol"],
                     normalized["price"],
                     normalized["quantity"],
                     normalized["side"],
                     normalized["trade_id"],
+                    normalized["timestamp"],
+                    persisted,
                 )
 
-        except Exception as exc:
+        except Exception:
             with self._lock:
                 self._rejected_count += 1
+                self._last_error = "Unexpected error in trade callback."
 
-            logger.exception(
-                "Lỗi xử lý DNSE trade_extra callback: %s",
-                exc,
-            )
+            logger.exception("Lỗi xử lý callback trade_extra.")
 
     # --------------------------------------------------------
-    # 8.10. Error recorder
+    # Error recorder
     # --------------------------------------------------------
 
     def _record_error(self, message: str) -> None:
@@ -1349,40 +1480,26 @@ class DNSEFootprintStream:
             self._last_error = str(message)
             self._connected = False
             self._authenticated = False
+            self._subscribed = False
 
-        logger.error(
-            "DNSE stream error: %s",
-            message,
-        )
+        logger.error("DNSE stream error: %s", message)
 
 
 # ============================================================
-# 9. SINGLETON FOR routes.py
+# 11. SINGLETON AND SHORTCUTS
 # ============================================================
 
 stream = DNSEFootprintStream()
 
 
-# ============================================================
-# 10. OPTIONAL SHORTCUTS
-# ============================================================
-
 def start_stream() -> bool:
-    """
-    Hàm tiện ích nếu một module khác muốn khởi động stream.
-    """
     return stream.start()
 
 
 def stop_stream() -> bool:
-    """
-    Hàm tiện ích nếu một module khác muốn dừng stream.
-    """
     return stream.stop()
 
 
 def get_stream_status() -> dict[str, Any]:
-    """
-    Hàm tiện ích lấy trạng thái stream.
-    """
     return stream.get_status()
+
